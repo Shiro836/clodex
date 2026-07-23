@@ -69,7 +69,12 @@ Claude Code's model picker maps automatically:
 | sonnet    | gpt-5.6-terra |
 | haiku     | gpt-5.6-luna |
 
-Override defaults via `CLODEX_MODEL` / `CLODEX_SMALL_MODEL`.
+Override the startup defaults via `CLODEX_MODEL` / `CLODEX_SMALL_MODEL`.
+
+The launcher enables gateway model discovery, so Claude Code's `/model` picker
+lists the proxy's **full catalog** — the whole 5.6 lineup (`gpt-5.6-luna`,
+`gpt-5.6-sol`, `gpt-5.6-terra`, plus `-fast` variants) and the older
+`gpt-5.2 … gpt-5.5`. Switch in-session with `/model` or `/model <id>`.
 
 ## Note on terms
 
