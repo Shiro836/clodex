@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# clodex — launch an unmodified Claude Code that is routed to your ChatGPT/
+# Codex subscription instead of the Anthropic API.
+#
+# It does NOT patch or touch the Claude Code binary. It only:
+#   1. makes sure a local Anthropic->Codex translation proxy is running
+#      (auto-started once, then reused across sessions), and
+#   2. execs the real `claude` binary with a handful of env vars that exist
+#      *only* for that child process.
+#
+# Running plain `claude` in another terminal is completely unaffected: it sees
+# none of these variables and keeps talking to Anthropic with its own
+# ~/.claude config. clodex uses a separate ~/.clodex config dir.
+#
+set -euo pipefail
+
+# --- configuration (override any of these via the environment) -------------
+: "${CLODEX_PROXY_BIN:=clodex-proxy}"
+: "${CLODEX_HOST:=127.0.0.1}"
+: "${CLODEX_PORT:=18765}"
+: "${CLODEX_MODEL:=gpt-5.6-sol}"
+: "${CLODEX_SMALL_MODEL:=gpt-5.6-luna}"
+: "${CLODEX_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
+: "${CLODEX_CONFIG_DIR:=$HOME/.clodex}"
+: "${CODEX_HOME:=$HOME/.codex}"
+: "${CLODEX_CODEX_AUTH:=$CODEX_HOME/auth.json}"
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/clodex"
+log_file="$state_dir/proxy.log"
+
+die() { printf 'clodex: %s\n' "$*" >&2; exit 1; }
+
+port_open() { (exec 3<>"/dev/tcp/$CLODEX_HOST/$CLODEX_PORT") 2>/dev/null && exec 3>&- 3<&-; }
+
+proxy_pids() { pgrep -f "$CLODEX_PROXY_BIN serve" 2>/dev/null || true; }
+
+start_proxy() {
+    command -v "$CLODEX_PROXY_BIN" >/dev/null 2>&1 \
+        || die "proxy binary '$CLODEX_PROXY_BIN' not on PATH (install the clodex package)."
+    mkdir -p "$state_dir"
+    # CCP_USE_CODEX_CLI_AUTH=1 makes the fork read/refresh ~/.codex/auth.json,
+    # so no separate login is needed. setsid + redirects fully detach it so it
+    # persists across clodex sessions.
+    CCP_USE_CODEX_CLI_AUTH=1 CODEX_HOME="$CODEX_HOME" \
+        setsid "$CLODEX_PROXY_BIN" serve --port "$CLODEX_PORT" \
+        >>"$log_file" 2>&1 </dev/null &
+    for _ in $(seq 1 100); do
+        port_open && return 0
+        sleep 0.1
+    done
+    die "proxy did not come up within 10s; see $log_file"
+}
+
+# --- optional maintenance subcommands: `clodex --proxy <cmd>` ---------------
+if [ "${1:-}" = "--proxy" ]; then
+    case "${2:-status}" in
+        status)
+            if port_open; then echo "clodex proxy: running on $CLODEX_HOST:$CLODEX_PORT (pids: $(proxy_pids | tr '\n' ' '))";
+            else echo "clodex proxy: not running"; fi ;;
+        stop)    pids=$(proxy_pids); [ -n "$pids" ] && kill $pids && echo "stopped: $pids" || echo "not running" ;;
+        restart) pids=$(proxy_pids); [ -n "$pids" ] && kill $pids; sleep 0.3; start_proxy && echo "restarted" ;;
+        log)     exec tail -n "${3:-50}" -f "$log_file" ;;
+        *)       die "unknown --proxy command '${2:-}'. use: status | stop | restart | log" ;;
+    esac
+    exit 0
+fi
+
+# --- preflight -------------------------------------------------------------
+[ -r "$CLODEX_CODEX_AUTH" ] \
+    || die "no Codex credentials at $CLODEX_CODEX_AUTH — run 'codex login' first."
+[ -x "$CLODEX_CLAUDE_BIN" ] \
+    || die "claude binary not found at $CLODEX_CLAUDE_BIN (set CLODEX_CLAUDE_BIN)."
+mkdir -p "$CLODEX_CONFIG_DIR"
+
+# --- ensure the proxy daemon is up (started once, reused thereafter) --------
+port_open || start_proxy
+
+# --- exec the untouched Claude Code, scoped to the Codex subscription -------
+# These assignments live ONLY in this child process (see `env` below); they are
+# never exported to your shell or to any other running claude.
+exec env -u ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL="http://$CLODEX_HOST:$CLODEX_PORT" \
+    ANTHROPIC_AUTH_TOKEN="clodex" \
+    ANTHROPIC_MODEL="$CLODEX_MODEL" \
+    ANTHROPIC_SMALL_FAST_MODEL="$CLODEX_SMALL_MODEL" \
+    ANTHROPIC_CONFIG_DIR="$CLODEX_CONFIG_DIR" \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
+    DISABLE_UPDATES=1 \
+    DISABLE_INSTALLATION_CHECKS=1 \
+    DISABLE_AUTOUPDATER=1 \
+    "$CLODEX_CLAUDE_BIN" "$@"
