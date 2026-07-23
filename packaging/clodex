@@ -19,8 +19,15 @@ set -euo pipefail
 : "${CLODEX_PROXY_BIN:=clodex-proxy}"
 : "${CLODEX_HOST:=127.0.0.1}"
 : "${CLODEX_PORT:=18765}"
-: "${CLODEX_MODEL:=gpt-5.6-sol}"
-: "${CLODEX_SMALL_MODEL:=gpt-5.6-luna}"
+# CLODEX_MODEL is intentionally EMPTY by default: we do NOT pin ANTHROPIC_MODEL,
+# so Claude Code shows its native Opus/Sonnet/Haiku picker. Those claude ids
+# resolve through the proxy to Codex tiers (opus->sol, sonnet->terra, haiku->luna).
+# Pinning a raw gpt-* id instead would collapse the picker to a single "Custom
+# model". Set CLODEX_MODEL to pin one anyway (e.g. claude-fable-5, gpt-5.6-luna).
+: "${CLODEX_MODEL:=}"
+# The small/fast (background + subagent-haiku) model DOES need a resolvable id,
+# or those requests 400. claude-haiku-4-5 -> gpt-5.6-luna via the proxy.
+: "${CLODEX_SMALL_MODEL:=claude-haiku-4-5}"
 : "${CLODEX_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
 : "${CLODEX_CONFIG_DIR:=$HOME/.clodex}"
 : "${CODEX_HOME:=$HOME/.codex}"
@@ -80,16 +87,20 @@ port_open || start_proxy
 # These assignments live ONLY in this child process (see `env` below); they are
 # never exported to your shell or to any other running claude.
 #
-# NOTE: do NOT set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 here. Claude Code
-# classifies the `/v1/models` gateway-discovery fetch as "nonessential", so that
-# flag silently disables the model picker (only the pinned model would show).
+# We rely on Claude Code's built-in Opus/Sonnet/Haiku picker (they resolve
+# through the proxy), NOT gateway /v1/models discovery — so nonessential traffic
+# is disabled to keep things quiet. Only pin ANTHROPIC_MODEL when the user
+# explicitly set CLODEX_MODEL, otherwise leave Claude Code on its native default.
+model_env=()
+[ -n "${CLODEX_MODEL:-}" ] && model_env+=("ANTHROPIC_MODEL=$CLODEX_MODEL")
+
 exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_BASE_URL="http://$CLODEX_HOST:$CLODEX_PORT" \
     ANTHROPIC_AUTH_TOKEN="clodex" \
-    ANTHROPIC_MODEL="$CLODEX_MODEL" \
     ANTHROPIC_SMALL_FAST_MODEL="$CLODEX_SMALL_MODEL" \
     ANTHROPIC_CONFIG_DIR="$CLODEX_CONFIG_DIR" \
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+    "${model_env[@]}" \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
     CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
     DISABLE_UPDATES=1 \

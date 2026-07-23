@@ -69,12 +69,23 @@ Claude Code's model picker maps automatically:
 | sonnet    | gpt-5.6-terra |
 | haiku     | gpt-5.6-luna |
 
-Override the startup defaults via `CLODEX_MODEL` / `CLODEX_SMALL_MODEL`.
+clodex does **not** pin a model — it uses Claude Code's native Opus/Sonnet/Haiku
+picker, and those claude ids resolve through the proxy to Codex tiers:
 
-The launcher enables gateway model discovery, so Claude Code's `/model` picker
-lists the proxy's **full catalog** — the whole 5.6 lineup (`gpt-5.6-luna`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, plus `-fast` variants) and the older
-`gpt-5.2 … gpt-5.5`. Switch in-session with `/model` or `/model <id>`.
+| Claude Code picker | Codex model |
+|--------------------|-------------|
+| Opus   | `gpt-5.6-sol` |
+| Sonnet | `gpt-5.6-terra` |
+| Haiku  | `gpt-5.6-luna` |
+
+This is why we *don't* enable gateway `/v1/models` discovery (and keep
+nonessential traffic disabled): the built-in picker already covers the tiers,
+and pinning a raw `gpt-*` id would collapse the picker to a single "Custom
+model". To use a raw id or a variant the picker can't show (`-fast`, `gpt-5.5`,
+…), type it in-session: `/model gpt-5.6-luna-fast`.
+
+Pin a startup model with `CLODEX_MODEL` (e.g. `CLODEX_MODEL=claude-fable-5 clodex`)
+and the background/subagent model with `CLODEX_SMALL_MODEL`.
 
 ## Note on terms
 
