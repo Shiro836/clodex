@@ -10,8 +10,9 @@
 #      *only* for that child process.
 #
 # Running plain `claude` in another terminal is completely unaffected: it sees
-# none of these variables and keeps talking to Anthropic with its own
-# ~/.claude config. clodex uses a separate ~/.clodex config dir.
+# none of these variables and keeps talking to Anthropic. Both commands use
+# Claude Code's normal configuration, so settings, plugins, and sessions remain
+# shared.
 #
 set -euo pipefail
 
@@ -29,7 +30,6 @@ set -euo pipefail
 # or those requests 400. claude-haiku-4-5 -> gpt-5.6-luna via the proxy.
 : "${CLODEX_SMALL_MODEL:=claude-haiku-4-5}"
 : "${CLODEX_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
-: "${CLODEX_CONFIG_DIR:=$HOME/.clodex}"
 : "${CODEX_HOME:=$HOME/.codex}"
 : "${CLODEX_CODEX_AUTH:=$CODEX_HOME/auth.json}"
 
@@ -78,7 +78,6 @@ fi
     || die "no Codex credentials at $CLODEX_CODEX_AUTH — run 'codex login' first."
 [ -x "$CLODEX_CLAUDE_BIN" ] \
     || die "claude binary not found at $CLODEX_CLAUDE_BIN (set CLODEX_CLAUDE_BIN)."
-mkdir -p "$CLODEX_CONFIG_DIR"
 
 # --- ensure the proxy daemon is up (started once, reused thereafter) --------
 port_open || start_proxy
@@ -98,7 +97,6 @@ exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_BASE_URL="http://$CLODEX_HOST:$CLODEX_PORT" \
     ANTHROPIC_AUTH_TOKEN="clodex" \
     ANTHROPIC_SMALL_FAST_MODEL="$CLODEX_SMALL_MODEL" \
-    ANTHROPIC_CONFIG_DIR="$CLODEX_CONFIG_DIR" \
     "${model_env[@]}" \
     CLAUDE_CODE_ENABLE_AUTO_MODE=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# claudeep — launch an unmodified Claude Code against DeepSeek's
+# Anthropic-compatible API while sharing Claude Code's normal configuration.
+#
+# Provider and model overrides exist only for the child process. Settings,
+# plugins, MCP servers, and sessions remain in the same config used by `claude`.
+#
+set -euo pipefail
+
+: "${CLAUDEEP_BASE_URL:=https://api.deepseek.com/anthropic}"
+: "${CLAUDEEP_MODEL:=}"
+: "${CLAUDEEP_SMALL_MODEL:=deepseek-v4-flash}"
+: "${CLAUDEEP_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
+: "${CLAUDEEP_API_KEY_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/claudeep/api-key}"
+
+api_key="${CLAUDEEP_API_KEY:-${DEEPSEEK_API_KEY:-}}"
+if [ -z "$api_key" ] && [ -r "$CLAUDEEP_API_KEY_FILE" ]; then
+    api_key="$(<"$CLAUDEEP_API_KEY_FILE")"
+fi
+
+die() { printf 'claudeep: %s\n' "$*" >&2; exit 1; }
+
+[ -n "$api_key" ] \
+    || die "no DeepSeek API key — set CLAUDEEP_API_KEY, DEEPSEEK_API_KEY, or $CLAUDEEP_API_KEY_FILE."
+[ -x "$CLAUDEEP_CLAUDE_BIN" ] \
+    || die "claude binary not found at $CLAUDEEP_CLAUDE_BIN (set CLAUDEEP_CLAUDE_BIN)."
+
+# Keep Claude Code's native picker. DeepSeek maps claude-opus* to V4 Pro and
+# claude-sonnet*/claude-haiku* to V4 Flash. Set CLAUDEEP_MODEL to pin an exact
+# model instead (for example, deepseek-v4-pro[1m]).
+model_env=()
+[ -n "$CLAUDEEP_MODEL" ] && model_env+=("ANTHROPIC_MODEL=$CLAUDEEP_MODEL")
+
+exec env -u ANTHROPIC_API_KEY \
+    ANTHROPIC_BASE_URL="$CLAUDEEP_BASE_URL" \
+    ANTHROPIC_AUTH_TOKEN="$api_key" \
+    ANTHROPIC_SMALL_FAST_MODEL="$CLAUDEEP_SMALL_MODEL" \
+    "${model_env[@]}" \
+    CLAUDE_CODE_ENABLE_AUTO_MODE=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+    DISABLE_UPDATES=1 \
+    DISABLE_INSTALLATION_CHECKS=1 \
+    DISABLE_AUTOUPDATER=1 \
+    "$CLAUDEEP_CLAUDE_BIN" "$@"
