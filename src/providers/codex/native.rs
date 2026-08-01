@@ -69,6 +69,7 @@ struct NativeResolved {
     stream: bool,
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
     let object = body.as_object().ok_or_else(|| {
         openai_error(
@@ -110,6 +111,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
     Ok(requested)
 }
 
+#[allow(clippy::result_large_err)]
 fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     let requested = validate_native_request_model(body)?;
     let object = body
@@ -221,7 +223,7 @@ impl NativeResponseOutcome {
         self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 
-    fn fail(&self, message: String) {
+    pub(crate) fn fail(&self, message: String) {
         if let Ok(mut failure) = self.failure.lock()
             && failure.is_none()
         {
@@ -689,7 +691,7 @@ mod tests {
 
     #[test]
     fn native_request_resolves_alias_and_fast_tier() {
-        let mut body = request(json!({"model":"claude-opus-4-8","input":[]}));
+        let mut body = request(json!({"model":"claude-opus-5","input":[]}));
         let resolved = shape_native_request(&mut body).unwrap();
         assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(body["model"], "gpt-5.6-sol");

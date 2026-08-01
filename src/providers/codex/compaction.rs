@@ -161,9 +161,7 @@ pub fn apply_compaction_replay(
     };
 
     let (envelope, conversation) = split_input_envelope(&request.input);
-    let Some(summary_item) = conversation.first() else {
-        return None;
-    };
+    let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
         registry.states.remove(session_id);
         update_total_bytes(registry);
@@ -199,10 +197,10 @@ pub fn abort_compaction_attempt(
     compact_boundary: bool,
     request: &ResponsesRequest,
 ) {
-    if compact_boundary || request_contains_compaction(request) {
-        if let Some(session_id) = session_id {
-            clear_compaction(session_id);
-        }
+    if (compact_boundary || request_contains_compaction(request))
+        && let Some(session_id) = session_id
+    {
+        clear_compaction(session_id);
     }
 }
 

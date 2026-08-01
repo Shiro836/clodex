@@ -17,6 +17,9 @@ pub enum EndpointKind {
     Messages,
     CountTokens,
     Responses,
+    ChatCompletions,
+    Images,
+    Transcriptions,
 }
 
 impl EndpointKind {
@@ -25,6 +28,9 @@ impl EndpointKind {
             Self::Messages => "messages",
             Self::CountTokens => "count_tokens",
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
+            Self::Images => "images",
+            Self::Transcriptions => "transcriptions",
         }
     }
 }
@@ -33,6 +39,7 @@ impl EndpointKind {
 pub enum RequestStatus {
     Started,
     ProviderSelected,
+    Compacting,
     Upstream,
     Streaming,
     Completed,
@@ -44,6 +51,7 @@ impl RequestStatus {
         match self {
             Self::Started => "started",
             Self::ProviderSelected => "selected",
+            Self::Compacting => "compacting",
             Self::Upstream => "upstream",
             Self::Streaming => "streaming",
             Self::Completed => "completed",
@@ -77,6 +85,9 @@ pub enum MonitorEvent {
     ModelResolved {
         request_id: String,
         model: String,
+    },
+    CompactionStarted {
+        request_id: String,
     },
     UpstreamStarted {
         request_id: String,
@@ -367,6 +378,12 @@ impl MonitorHandle {
         });
     }
 
+    pub fn compaction_started(&self, request_id: impl Into<String>) {
+        self.publish(MonitorEvent::CompactionStarted {
+            request_id: request_id.into(),
+        });
+    }
+
     pub fn upstream_started(&self, request_id: impl Into<String>) {
         self.publish(MonitorEvent::UpstreamStarted {
             request_id: request_id.into(),
@@ -525,6 +542,11 @@ impl MonitorStore {
                         Some(incoming) => incoming,
                         None => model,
                     });
+                }
+            }
+            MonitorEvent::CompactionStarted { request_id } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.status = RequestStatus::Compacting;
                 }
             }
             MonitorEvent::UpstreamStarted { request_id } => {
@@ -1056,6 +1078,18 @@ mod tests {
 
         let state = monitor.snapshot();
         assert_eq!(state.active[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn compaction_started_marks_request_compacting() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
+        monitor.compaction_started("r1");
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].status, RequestStatus::Compacting);
+        assert_eq!(state.sessions[0].last_status, "compacting");
     }
 
     #[test]

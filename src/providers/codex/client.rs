@@ -11,6 +11,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
+use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,106 @@ pub fn build_native_codex_headers(
     Ok(headers)
 }
 
+pub fn build_codex_search_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = build_codex_headers(auth, ctx, false)?;
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    let originator = config::codex_originator(RESPONSES_LITE_ORIGINATOR);
+    headers.insert("originator", header_value("originator", &originator)?);
+    let user_agent = config::codex_user_agent(RESPONSES_LITE_ORIGINATOR);
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
+pub fn build_codex_image_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        header_value("content-type", "application/json")?,
+    );
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        header_value("authorization", &format!("Bearer {}", auth.access))?,
+    );
+    headers.insert(
+        "originator",
+        header_value("originator", &config::codex_originator(ORIGINATOR))?,
+    );
+    if let Some(account_id) = auth.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
+        );
+    }
+    let user_agent = config::codex_user_agent(&default_user_agent(false));
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
+pub fn build_codex_transcription_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        header_value("authorization", &format!("Bearer {}", auth.access))?,
+    );
+    headers.insert("originator", header_value("originator", "Codex Desktop")?);
+    if let Some(account_id) = auth.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
+        );
+    }
+    let user_agent = config::codex_user_agent(&default_user_agent(false));
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
 fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError> {
     http::HeaderValue::from_str(value).map_err(|e| CodexError {
         status: 500,
@@ -188,6 +289,14 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
         retry_after: None,
         origin: CodexErrorOrigin::Http,
     })
+}
+
+fn search_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    match base_url.strip_suffix("/responses") {
+        Some(api_root) => format!("{api_root}/alpha/search"),
+        None => format!("{base_url}/alpha/search"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,18 +357,176 @@ pub struct CodexResponse {
 const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
+const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 
-fn native_http_client() -> reqwest::Client {
+#[derive(Clone)]
+struct ProxyEnvironment {
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    all_proxy: Option<String>,
+    no_proxy: Option<reqwest::NoProxy>,
+    no_proxy_value: Option<String>,
+}
+
+impl ProxyEnvironment {
+    fn from_env() -> Self {
+        if std::env::var_os("REQUEST_METHOD").is_some() {
+            return Self {
+                http_proxy: None,
+                https_proxy: None,
+                all_proxy: None,
+                no_proxy: None,
+                no_proxy_value: None,
+            };
+        }
+
+        let no_proxy_value = std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .ok();
+        Self {
+            http_proxy: proxy_env_value("HTTP_PROXY", "http_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            https_proxy: proxy_env_value("HTTPS_PROXY", "https_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            all_proxy: proxy_env_value("ALL_PROXY", "all_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            no_proxy: no_proxy_value
+                .as_deref()
+                .and_then(reqwest::NoProxy::from_string),
+            no_proxy_value,
+        }
+    }
+
+    fn websocket_proxy_config(&self) -> super::websocket::WebSocketProxyConfig {
+        super::websocket::WebSocketProxyConfig::new(
+            self.http_proxy.as_deref(),
+            self.https_proxy.as_deref(),
+            self.all_proxy.as_deref(),
+            self.no_proxy_value.as_deref(),
+        )
+    }
+
+    fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder = builder.no_proxy();
+        if let Some(proxy) = self.http_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::http(proxy)
+                    .expect("validated HTTP_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        if let Some(proxy) = self.https_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::https(proxy)
+                    .expect("validated HTTPS_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        if let Some(proxy) = self.all_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .expect("validated ALL_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        builder
+    }
+}
+
+fn native_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    proxy_environment
+        .apply(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .expect("failed to create native Responses HTTP client")
+}
+
+fn proxy_env_value(
+    uppercase: &'static str,
+    lowercase: &'static str,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw) = std::env::var_os(uppercase).or_else(|| std::env::var_os(lowercase)) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| uppercase)?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    normalize_proxy_url(raw).map(Some).ok_or(uppercase)
+}
+
+fn normalize_proxy_url(raw: &str) -> Option<String> {
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    if !matches!(
+        parsed.scheme(),
+        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+    ) || parsed.host_str().is_none()
+        || matches!(parsed.scheme(), "socks4" | "socks4a")
+            && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    let tls_config = super::websocket::websocket_tls_config();
+    proxy_environment
+        .apply(
+            reqwest::Client::builder()
+                .http1_only()
+                .redirect(reqwest::redirect::Policy::none())
+                .use_preconfigured_tls((*tls_config).clone()),
+        )
+        .build()
+        .expect("failed to create Codex WebSocket HTTP client")
+}
+
+fn custom_client_auto_http_fallback_enabled(
+    base_url: &str,
+    proxy_config: &super::websocket::WebSocketProxyConfig,
+) -> bool {
+    let Ok(websocket_url) = super::websocket::to_websocket_url(base_url) else {
+        return false;
+    };
+    !proxy_config.uses_proxy_for(&websocket_url)
+}
+
+#[cfg(test)]
+fn test_native_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
-        .expect("failed to create native Responses HTTP client")
+        .expect("failed to create test native Responses HTTP client")
+}
+
+#[cfg(test)]
+fn test_websocket_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .expect("failed to create test WebSocket HTTP client")
 }
 
 pub struct CodexHttpClient {
     client: reqwest::Client,
     native_client: reqwest::Client,
+    websocket_client: reqwest::Client,
+    websocket_proxy_config: super::websocket::WebSocketProxyConfig,
+    auto_http_fallback_enabled: bool,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
     header_timeout_ms: u64,
@@ -277,12 +544,16 @@ impl Default for CodexHttpClient {
 impl CodexHttpClient {
     pub fn new() -> Self {
         let timeout_ms = 60_000;
+        let proxy_environment = ProxyEnvironment::from_env();
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
+            client: proxy_environment
+                .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
                 .build()
                 .expect("failed to create HTTP client"),
-            native_client: native_http_client(),
+            native_client: native_http_client(&proxy_environment),
+            websocket_client: websocket_http_client(&proxy_environment),
+            websocket_proxy_config: proxy_environment.websocket_proxy_config(),
+            auto_http_fallback_enabled: true,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
@@ -296,8 +567,15 @@ impl CodexHttpClient {
         auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
         base_url: String,
     ) -> Self {
+        let proxy_environment = ProxyEnvironment::from_env();
+        let websocket_proxy_config = proxy_environment.websocket_proxy_config();
+        let auto_http_fallback_enabled =
+            custom_client_auto_http_fallback_enabled(&base_url, &websocket_proxy_config);
         Self {
-            native_client: native_http_client(),
+            native_client: native_http_client(&proxy_environment),
+            websocket_client: websocket_http_client(&proxy_environment),
+            websocket_proxy_config,
+            auto_http_fallback_enabled,
             client,
             auth_manager,
             base_url,
@@ -316,7 +594,10 @@ impl CodexHttpClient {
         header_timeout_retries: u32,
     ) -> Self {
         Self {
-            native_client: native_http_client(),
+            native_client: test_native_http_client(),
+            websocket_client: test_websocket_http_client(),
+            websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
+            auto_http_fallback_enabled: true,
             client,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
@@ -332,6 +613,176 @@ impl CodexHttpClient {
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
+    }
+
+    pub(crate) async fn post_transcription(
+        &self,
+        base_url: &str,
+        input: &super::transcription::PreparedTranscription,
+        ctx: &RequestContext,
+    ) -> Result<reqwest::Response, CodexError> {
+        let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let mut refresh_attempted = false;
+
+        loop {
+            let headers = build_codex_transcription_headers(&auth, ctx)?;
+            let response = self.attempt_transcription(&url, &headers, input).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                refresh_attempted = true;
+                drop(response);
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    async fn attempt_transcription(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        input: &super::transcription::PreparedTranscription,
+    ) -> Result<reqwest::Response, CodexError> {
+        let part = reqwest::multipart::Part::bytes(input.audio.to_vec())
+            .file_name(input.filename.clone())
+            .mime_str(&input.content_type)
+            .map_err(|error| CodexError {
+                status: 400,
+                message: "Invalid audio content type".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(language) = input.language.as_deref() {
+            form = form.text("language", language.to_string());
+        }
+        let mut request = self.native_client.post(url).multipart(form);
+        for (key, value) in headers {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        tokio::time::timeout(
+            Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
+            request.send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex transcription response headers",
+                IMAGE_HEADER_TIMEOUT_MS
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|error| CodexError {
+            status: 0,
+            message: format!("Codex transcription transport error: {error}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
+    }
+
+    pub(crate) async fn post_image_json(
+        &self,
+        base_url: &str,
+        operation: super::images::ImageOperation,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+    ) -> Result<reqwest::Response, CodexError> {
+        let body_json = serde_json::to_vec(body).map_err(|error| CodexError {
+            status: 500,
+            message: "Failed to serialize image request".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let url = format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            operation.upstream_path()
+        );
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let mut refresh_attempted = false;
+
+        loop {
+            let headers = build_codex_image_headers(&auth, ctx)?;
+            let response = self
+                .attempt_image_json(&url, &headers, body_json.clone())
+                .await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                refresh_attempted = true;
+                drop(response);
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    async fn attempt_image_json(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        body_json: Vec<u8>,
+    ) -> Result<reqwest::Response, CodexError> {
+        let mut request = self.native_client.post(url);
+        for (key, value) in headers {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        tokio::time::timeout(
+            Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
+            request.body(body_json).send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex image response headers",
+                IMAGE_HEADER_TIMEOUT_MS
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|error| CodexError {
+            status: 0,
+            message: format!("Codex image transport error: {error}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
     }
 
     pub async fn post_native_responses(
@@ -434,6 +885,68 @@ impl CodexHttpClient {
             .await
     }
 
+    pub async fn post_search(
+        &self,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+    ) -> Result<SearchResponse, CodexError> {
+        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
+        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
+            status: 500,
+            message: "Failed to serialize search request".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let mut auth_refresh_attempted = false;
+        let mut retries = 0_u32;
+
+        loop {
+            let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
+            if response.status == 401 && !auth_refresh_attempted {
+                auth_refresh_attempted = true;
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            if should_retry_codex_status(response.status)
+                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
+            {
+                let retry_after = response
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str());
+                let delay = compute_backoff_delay(retries, retry_after);
+                if delay.exceeds_budget {
+                    return Err(codex_status_error(response));
+                }
+                retries += 1;
+                sleep(delay.wait_ms).await;
+                continue;
+            }
+            if !(200..300).contains(&response.status) {
+                return Err(codex_status_error(response));
+            }
+            return serde_json::from_slice(&response.body).map_err(|e| CodexError {
+                status: 502,
+                message: "Failed to decode Codex search response".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
+    }
+
     async fn post_codex_with_transport(
         &self,
         body: &ResponsesRequest,
@@ -486,6 +999,8 @@ impl CodexHttpClient {
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
                     super::websocket::codex_websocket_request(
+                        &self.websocket_client,
+                        &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
@@ -506,6 +1021,8 @@ impl CodexHttpClient {
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
+                        &self.websocket_client,
+                        &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
@@ -520,7 +1037,9 @@ impl CodexHttpClient {
 
                     match ws_result {
                         Ok(response) => Ok(response),
-                        Err(err) if should_fallback_to_http(&err) => {
+                        Err(err)
+                            if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
+                        {
                             // Fall back to HTTP only if WebSocket failed before sending
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
@@ -835,6 +1354,8 @@ impl CodexHttpClient {
             };
             let ws_body = build_websocket_request(&body, continuation.as_ref());
             let start = super::websocket::codex_websocket_event_stream(
+                &self.websocket_client,
+                &self.websocket_proxy_config,
                 &self.base_url,
                 &ws_headers,
                 &ws_body,
@@ -1071,6 +1592,107 @@ impl CodexHttpClient {
 
         Ok(CodexResponse {
             body: body_bytes,
+            status,
+            headers,
+            transport: ActualTransport::Http,
+        })
+    }
+
+    async fn attempt_post_search(
+        &self,
+        auth: &StoredAuth,
+        body_json: &str,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
+        let url = search_endpoint(&self.base_url);
+        let headers = build_codex_search_headers(auth, ctx)?;
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_codex_http_request_capture(traffic, &url, &headers, body_json);
+        }
+
+        let mut request = self.client.post(&url);
+        for (key, value) in headers.iter() {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        let started_at = Instant::now();
+        let mut response = tokio::time::timeout(
+            Duration::from_millis(self.header_timeout_ms),
+            request.body(body_json.to_string()).send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex search response headers",
+                self.header_timeout_ms
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|e| CodexError {
+            status: 0,
+            message: format!("Codex search network error: {e}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let mut body = Vec::new();
+        let mut response_started = false;
+        loop {
+            let chunk = tokio::time::timeout(
+                Duration::from_millis(self.body_idle_timeout_ms),
+                response.chunk(),
+            )
+            .await
+            .map_err(|_| CodexError {
+                status: 0,
+                message: format!(
+                    "Timed out waiting {}ms for the next Codex search response body chunk",
+                    self.body_idle_timeout_ms
+                ),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?
+            .map_err(|e| CodexError {
+                status: 0,
+                message: format!("Transport error reading Codex search response body: {e}"),
+                detail: Some("http_response_body".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if !response_started {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.generation_started(&ctx.req_id);
+                }
+                response_started = true;
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_upstream_response_capture(traffic, status, started_at.elapsed(), &headers, &body);
+        }
+
+        Ok(CodexResponse {
+            body,
             status,
             headers,
             transport: ActualTransport::Http,
@@ -1326,6 +1948,9 @@ fn log_buffered_retry_exhausted(
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
+        if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
+            return false;
+        }
         return err.status == 0 || should_retry_codex_status(err.status);
     }
     if err.detail.as_deref() == Some("websocket_pre_request") {
@@ -1377,6 +2002,8 @@ fn should_refresh_after_unauthorized(
 
 fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
+        && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
+        && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
 }
 
 fn should_retry_without_continuation(
@@ -1448,6 +2075,56 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn normalizes_supported_proxy_urls() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080/")
+        );
+        assert_eq!(
+            normalize_proxy_url("https://user:pass@proxy.example:8443").as_deref(),
+            Some("https://user:pass@proxy.example:8443/")
+        );
+        for scheme in ["socks4", "socks4a"] {
+            let proxy = format!("{scheme}://proxy.example:1080");
+            assert_eq!(normalize_proxy_url(&proxy), Some(proxy));
+        }
+        for scheme in ["socks5", "socks5h"] {
+            let proxy = format!("{scheme}://user:pass@proxy.example:1080");
+            assert_eq!(normalize_proxy_url(&proxy), Some(proxy));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_proxy_urls() {
+        assert!(normalize_proxy_url("http://").is_none());
+        assert!(normalize_proxy_url("ftp://proxy.example:21").is_none());
+        assert!(normalize_proxy_url("socks4://user@proxy.example:1080").is_none());
+        assert!(normalize_proxy_url("socks4a://user:pass@proxy.example:1080").is_none());
+    }
+
+    #[test]
+    fn custom_client_auto_fallback_tracks_effective_proxy_route() {
+        let proxy = "http://proxy.example:8080";
+        let proxied =
+            super::super::websocket::WebSocketProxyConfig::new(None, Some(proxy), None, None);
+        assert!(!custom_client_auto_http_fallback_enabled(
+            "https://codex.invalid/responses",
+            &proxied
+        ));
+
+        let bypassed = super::super::websocket::WebSocketProxyConfig::new(
+            None,
+            Some(proxy),
+            None,
+            Some("codex.invalid"),
+        );
+        assert!(custom_client_auto_http_fallback_enabled(
+            "https://codex.invalid/responses",
+            &bypassed
+        ));
+    }
+
     fn http_test_auth() -> StoredAuth {
         StoredAuth {
             access: "test".into(),
@@ -1470,7 +2147,7 @@ mod tests {
 
     fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
         CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url,
             100,
             body_idle_timeout_ms,
@@ -1504,6 +2181,161 @@ mod tests {
         let client = http_test_client(base_url, 100);
         client.auth_manager().set_test_auth(http_test_auth());
         client
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before its body was complete");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return request;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_request_refreshes_once_after_unauthorized() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let server_client = client.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                if attempt == 0 {
+                    assert!(request.contains("authorization: Bearer test"));
+                    server_client.auth_manager().set_test_auth(StoredAuth {
+                        access: "rotated".into(),
+                        refresh: "rotated-refresh".into(),
+                        account_id: Some("acct-rotated".into()),
+                        expires: u64::MAX,
+                    });
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.contains("authorization: Bearer rotated"));
+                    assert!(request.contains("chatgpt-account-id: acct-rotated"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_request_does_not_retry_server_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_request_uses_fixed_path_oauth_and_json_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /root/images/generations HTTP/1.1"));
+            assert!(headers.contains("authorization: Bearer test"));
+            assert!(headers.contains("chatgpt-account-id: acct"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end + 4..]).unwrap();
+            assert_eq!(body["model"], "gpt-image-2");
+            assert_eq!(body["prompt"], "draw a fox");
+            let response = br#"{"created":1,"data":[{"b64_json":"aW1n"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(response).await.unwrap();
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}/root"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw a fox"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1679,6 +2511,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_search_posts_json_to_alpha_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /alpha/search HTTP/1.1"));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("accept: application/json")
+            );
+            assert!(headers.contains("authorization: Bearer test"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end + 4..]).unwrap();
+            assert_eq!(body["model"], "gpt-5.6-luna");
+            assert!(body.get("reasoning").is_none());
+            assert_eq!(body["commands"]["search_query"][0]["q"], "find Codex");
+
+            let response = serde_json::to_vec(&serde_json::json!({
+                "encrypted_output": "opaque",
+                "output": "search output",
+                "results": [{
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com",
+                    "title": "Example"
+                }]
+            }))
+            .unwrap();
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(response_headers.as_bytes()).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let request = super::super::search::SearchRequest {
+            id: "session".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "find Codex".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        };
+        let response = client
+            .post_search(&request, &http_test_context())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.output, "search output");
+        assert_eq!(response.results.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn auto_falls_back_to_http_after_statusful_websocket_handshake_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1687,7 +2590,11 @@ mod tests {
             let mut request = [0_u8; 16 * 1024];
             let read = websocket.read(&mut request).await.unwrap();
             assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .to_ascii_lowercase()
+                    .contains("upgrade: websocket")
+            );
             websocket
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 13\r\nconnection: close\r\n\r\npolicy denied",
@@ -1921,6 +2828,22 @@ mod tests {
     }
 
     #[test]
+    fn proxy_tunnel_rejection_is_not_retried_or_used_for_http_fallback() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket proxy tunnel was rejected".to_string(),
+            detail: Some(
+                super::super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string(),
+            ),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(!is_retryable_transport_error(&err));
+        assert!(!should_fallback_to_http(&err));
+    }
+
+    #[test]
     fn websocket_pre_request_statusless_error_is_retryable() {
         let err = CodexError {
             status: 0,
@@ -1958,6 +2881,33 @@ mod tests {
         };
 
         assert!(is_retryable_transport_error(&err));
+    }
+
+    #[test]
+    fn image_headers_reuse_oauth_without_responses_beta_headers() {
+        let auth = StoredAuth {
+            access: "tok".into(),
+            refresh: String::new(),
+            account_id: Some("acct".into()),
+            expires: u64::MAX,
+        };
+        let headers = build_codex_image_headers(&auth, &http_test_context()).unwrap();
+
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct");
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get(http::header::ACCEPT).unwrap(),
+            "application/json"
+        );
+        assert!(headers.get("openai-beta").is_none());
+        assert!(headers.get("x-codex-beta-features").is_none());
     }
 
     #[test]

@@ -37,6 +37,8 @@ struct FileConfig {
     pub port: Option<u16>,
     #[serde(rename = "aliasProvider")]
     pub alias_provider: Option<String>,
+    #[serde(rename = "autoReviewModel")]
+    pub auto_review_model: Option<String>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -58,6 +60,12 @@ struct CodexConfig {
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "imagesApi")]
+    pub images_api: Option<bool>,
+    #[serde(rename = "imagesBaseUrl")]
+    pub images_base_url: Option<String>,
+    #[serde(rename = "transcriptionsApi")]
+    pub transcriptions_api: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "reasoningSummary")]
@@ -118,9 +126,28 @@ fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
 }
 
 pub fn load_config() -> LoadedConfig {
-    let config_dir = paths::config_dir();
+    let env = paths::DirResolverEnv::default();
+    let config_dir = paths::resolve_config_dir(&env);
+    load_config_from_env(&env.env, config_dir)
+}
+
+pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
+    let home = env
+        .get("HOME")
+        .or_else(|| env.get("USERPROFILE"))
+        .cloned()
+        .unwrap_or_else(|| "/".to_string());
+    let resolver_env = paths::DirResolverEnv {
+        platform: std::env::consts::OS.to_string(),
+        env: env.clone(),
+        home,
+    };
+    let config_dir = paths::resolve_config_dir(&resolver_env);
+    load_config_from_env(env, config_dir)
+}
+
+fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> LoadedConfig {
     let file = read_file_config(&config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
 
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
@@ -224,6 +251,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_IMAGES_API") {
+        out.push("codex.imagesApi (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_IMAGES_BASE_URL") {
+        out.push("codex.imagesBaseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
+        out.push("codex.transcriptionsApi (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -254,6 +290,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
+    if env
+        .get("CCP_AUTO_REVIEW_MODEL")
+        .is_some_and(|raw| !raw.is_empty())
+    {
+        out.push("CCP_AUTO_REVIEW_MODEL (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
             out.push(format!("bindAddress: {bind_address}"));
@@ -263,6 +305,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         }
         if let Some(alias) = file_cfg.alias_provider {
             out.push(format!("aliasProvider: {alias}"));
+        }
+        if file_cfg
+            .auto_review_model
+            .is_some_and(|model| !model.is_empty())
+        {
+            out.push("autoReviewModel (config)".to_string());
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
@@ -284,6 +332,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if codex.images_api == Some(true) {
+                out.push("codex.imagesApi: true".to_string());
+            }
+            if codex.images_base_url.is_some() {
+                out.push("codex.imagesBaseUrl (config)".to_string());
+            }
+            if codex.transcriptions_api == Some(true) {
+                out.push("codex.transcriptionsApi: true".to_string());
             }
         }
     }
@@ -314,6 +371,62 @@ pub fn grok_client_version() -> String {
         return version;
     }
     "0.2.93".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Grok tool-image policy (CCP_GROK_TOOL_IMAGE)
+// ---------------------------------------------------------------------------
+
+/// How the Grok translator treats Anthropic `image` blocks (tool results and
+/// top-level user messages). `omit` is the safe default: degrade to the L1
+/// placeholder string. `reattach` keeps the placeholder in the tool output and
+/// additionally appends a user message carrying the images as `input_image`
+/// data URLs. `inline` sends the tool output itself as an array of
+/// `input_text` + `input_image` parts (string-only outputs still serialize as
+/// plain strings). `reject` restores the pre-L1 hard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokToolImageMode {
+    Omit,
+    Reattach,
+    Inline,
+    Reject,
+}
+
+pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
+    match raw.map(str::trim) {
+        Some("reattach") => GrokToolImageMode::Reattach,
+        Some("inline") => GrokToolImageMode::Inline,
+        Some("reject") => GrokToolImageMode::Reject,
+        // Any unknown/empty value degrades to the safe default.
+        _ => GrokToolImageMode::Omit,
+    }
+}
+
+pub fn grok_tool_image_mode() -> GrokToolImageMode {
+    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
+}
+
+/// Warn once at startup when an unknown mode was requested. Called from the
+/// Grok provider constructor rather than per request.
+pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
+    match std::env::var("CCP_GROK_TOOL_IMAGE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(other) if !matches!(other, "" | "omit" | "reattach" | "inline" | "reject") => {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "value".to_string(),
+                serde_json::Value::String(other.to_string()),
+            );
+            log.warn(
+                "unrecognized CCP_GROK_TOOL_IMAGE value; falling back to omit",
+                Some(fields),
+            );
+        }
+        _ => {}
+    }
 }
 
 pub fn is_verbose() -> bool {
@@ -472,6 +585,51 @@ pub fn codex_responses_api() -> bool {
     false
 }
 
+pub fn codex_images_api() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.images_api
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_transcriptions_api() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.transcriptions_api
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_images_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(url) = codex.images_base_url
+    {
+        return url;
+    }
+    "https://chatgpt.com/backend-api/codex".to_string()
+}
+
 pub fn codex_service_tier() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
@@ -530,6 +688,19 @@ pub fn codex_model() -> Option<String> {
         return codex.model;
     }
     None
+}
+
+pub fn auto_review_model() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env
+        .get("CCP_AUTO_REVIEW_MODEL")
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(raw.clone());
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.auto_review_model)
+        .filter(|model| !model.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +781,27 @@ pub fn cursor_client_version() -> String {
     {
         return version;
     }
-    "0.48.5".to_string()
+    detect_cursor_agent_version().unwrap_or_else(|| "cli-2026.07.23-e383d2b".to_string())
+}
+
+fn detect_cursor_agent_version() -> Option<String> {
+    let output = std::process::Command::new("cursor-agent")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?;
+    let version = version.lines().next()?.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(if version.starts_with("cli-") {
+        version.to_string()
+    } else {
+        format!("cli-{version}")
+    })
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {
@@ -646,34 +837,41 @@ mod tests {
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
+            std::env::remove_var("CCP_CODEX_IMAGES_API");
+            std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
+            std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
+            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
+    }
+
+    fn config_env(config: &tempfile::TempDir) -> HashMap<String, String> {
+        HashMap::from([(
+            "CCP_CONFIG_DIR".to_string(),
+            config.path().to_string_lossy().into_owned(),
+        )])
     }
 
     #[test]
     fn bind_address_defaults_to_loopback() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let env = config_env(&config);
 
-        assert_eq!(load_config().bind_address, "127.0.0.1");
+        assert_eq!(load_config_for_env(&env).bind_address, "127.0.0.1");
     }
 
     #[test]
     fn bind_address_reads_config_and_env_takes_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"bindAddress":"192.0.2.10"}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let mut env = config_env(&config);
 
-        assert_eq!(load_config().bind_address, "192.0.2.10");
-        let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
-        assert_eq!(load_config().bind_address, "0.0.0.0");
+        assert_eq!(load_config_for_env(&env).bind_address, "192.0.2.10");
+        env.insert("CCP_BIND_ADDRESS".to_string(), "0.0.0.0".to_string());
+        assert_eq!(load_config_for_env(&env).bind_address, "0.0.0.0");
     }
 
     struct EnvGuard {
@@ -772,31 +970,27 @@ mod tests {
 
     #[test]
     fn log_env_presence_enables_legacy_verbose_and_stderr() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-        let _verbose_env = EnvGuard::set("CCP_LOG_VERBOSE", "0");
-        let _stderr_env = EnvGuard::set("CCP_LOG_STDERR", "");
+        let mut env = config_env(&config);
+        env.insert("CCP_LOG_VERBOSE".to_string(), "0".to_string());
+        env.insert("CCP_LOG_STDERR".to_string(), String::new());
 
-        let loaded = load_config();
+        let loaded = load_config_for_env(&env);
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
     }
 
     #[test]
     fn log_config_values_apply_without_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"log":{"verbose":true,"stderr":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let env = config_env(&config);
 
-        let loaded = load_config();
+        let loaded = load_config_for_env(&env);
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
     }
@@ -842,6 +1036,52 @@ mod tests {
     }
 
     #[test]
+    fn codex_images_api_defaults_to_disabled_and_env_overrides_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"imagesApi":true,"imagesBaseUrl":"https://chatgpt.com/backend-api/codex-custom"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_images_api());
+        assert_eq!(
+            codex_images_base_url(),
+            "https://chatgpt.com/backend-api/codex-custom"
+        );
+        let _enabled_env = EnvGuard::set("CCP_CODEX_IMAGES_API", "false");
+        let _base_env = EnvGuard::set(
+            "CCP_CODEX_IMAGES_BASE_URL",
+            "https://chatgpt.com/backend-api/codex",
+        );
+        assert!(!codex_images_api());
+        assert_eq!(
+            codex_images_base_url(),
+            "https://chatgpt.com/backend-api/codex"
+        );
+    }
+
+    #[test]
+    fn codex_transcriptions_api_defaults_to_disabled_and_env_overrides_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"transcriptionsApi":true}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_transcriptions_api());
+        let _enabled_env = EnvGuard::set("CCP_CODEX_TRANSCRIPTIONS_API", "false");
+        assert!(!codex_transcriptions_api());
+    }
+
+    #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
@@ -874,6 +1114,29 @@ mod tests {
         {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+        }
+    }
+
+    #[test]
+    fn auto_review_model_reads_top_level_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"autoReviewModel":"grok-4.5"}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
+        {
+            let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+            assert_eq!(auto_review_model().as_deref(), Some("gpt-5.6-terra"));
+        }
+        {
+            let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "");
+            assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         }
     }
 

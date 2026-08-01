@@ -13,7 +13,7 @@ command = [
   "--message-format=json",
   "--",
   "-D",
-  "unused",
+  "warnings",
 ]
 
 [[check]]

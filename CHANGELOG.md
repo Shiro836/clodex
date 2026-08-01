@@ -1,4 +1,83 @@
-# Changelog
+---
+title: Changelog
+description: Release notes for claude-code-proxy.
+---
+
+## v0.1.30 (2026-07-31)
+
+- OpenAI-compatible clients can use Kimi, Grok, Cursor, or Codex through the
+  optional `POST /v1/chat/completions` and `POST /v1/responses` endpoints, with
+  support for streaming, reasoning, function tools, usage, and provider routing.
+- Codex users can transcribe audio through the optional OpenAI-compatible
+  `POST /v1/audio/transcriptions` endpoint using the existing Codex sign-in.
+  Enable it with `codex.transcriptionsApi` or
+  `CCP_CODEX_TRANSCRIPTIONS_API=1`.
+- Codex token estimates accurately count CJK text, long identifiers, minified
+  code, and base64-like content, improving context and compaction decisions.
+  ([#90](https://github.com/raine/claude-code-proxy/pull/90))
+- Codex WebSocket sessions remain reliable under high concurrency instead of
+  failing with 403 upgrade rejections.
+  ([#87](https://github.com/raine/claude-code-proxy/issues/87),
+  [#88](https://github.com/raine/claude-code-proxy/pull/88))
+
+## v0.1.29 (2026-07-30)
+
+- Codex honors required, disabled, and single-tool choices from Claude Code, and
+  disables parallel tool calls when requested.
+  ([#89](https://github.com/raine/claude-code-proxy/pull/89))
+
+## v0.1.28 (2026-07-29)
+
+- OpenAI-compatible clients can generate and edit images with `gpt-image-2`
+  through optional Codex Images API routes using the existing ChatGPT sign-in.
+  ([#85](https://github.com/raine/claude-code-proxy/pull/85))
+- Codex streams show estimated input usage from the start and exact usage at
+  completion, keeping Claude Code's live token counters useful.
+  ([#86](https://github.com/raine/claude-code-proxy/pull/86))
+
+## v0.1.27 (2026-07-29)
+
+- Grok streams remain reliable during long responses, keepalive events, and
+  output-token truncation instead of failing after partial output.
+- Forced Codex web searches keep the selected model, so Luna searches no longer
+  switch to Sol, while preserving domain filters and search usage reporting.
+  ([#53](https://github.com/raine/claude-code-proxy/pull/53))
+- Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  and `NO_PROXY`, restoring standard non-TUN HTTP proxy support.
+  ([#83](https://github.com/raine/claude-code-proxy/pull/83))
+
+## v0.1.26 (2026-07-28)
+
+- Standard OpenAI clients can use Codex through the optional
+  `POST /v1/chat/completions` endpoint, with streaming, reasoning effort, and
+  structured output support.
+- Cursor Agent works with current client versions and restores text, thinking,
+  usage, model mode, and fast-mode handling.
+- Claude Code's `claude-opus-5` model name routes correctly through Codex and
+  Kimi.
+- Claude Code's automatic security-review classifier can use a dedicated model
+  configured with `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel`.
+  ([#72](https://github.com/raine/claude-code-proxy/pull/72))
+- Codex retries empty successful completions and returns a clear error if no
+  usable response arrives. ([#70](https://github.com/raine/claude-code-proxy/pull/70),
+  [#71](https://github.com/raine/claude-code-proxy/pull/71))
+- Grok handles images in user messages and tool results without failing requests.
+  Images are omitted by default, with opt-in vision through
+  `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
+  ([#69](https://github.com/raine/claude-code-proxy/pull/69))
+- Nix builds use vendored dependencies for reproducible sandboxed builds.
+  ([#80](https://github.com/raine/claude-code-proxy/pull/80))
+
+## v0.1.25 (2026-07-24)
+
+- Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including
+  its one-million-token context window and `max` reasoning effort.
+  ([#79](https://github.com/raine/claude-code-proxy/pull/79))
+- The monitor shows active native Codex compaction requests with a dedicated
+  `compacting` status.
+- The new [documentation site](https://claude-code-proxy.raine.dev) provides
+  setup guides, provider details, configuration references, troubleshooting,
+  and an `llms.txt` version for coding agents.
 
 ## v0.1.24 (2026-07-23)
 
