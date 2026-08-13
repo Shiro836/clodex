@@ -10,6 +10,10 @@ set -euo pipefail
 
 : "${CLAUDEEP_BASE_URL:=https://api.deepseek.com/anthropic}"
 : "${CLAUDEEP_MODEL:=}"
+: "${CLAUDEEP_OPUS_MODEL:=deepseek-v4-pro}"
+: "${CLAUDEEP_SONNET_MODEL:=deepseek-v4-pro}"
+: "${CLAUDEEP_HAIKU_MODEL:=deepseek-v4-flash}"
+: "${CLAUDEEP_SUBAGENT_MODEL:=deepseek-v4-flash}"
 : "${CLAUDEEP_SMALL_MODEL:=deepseek-v4-flash}"
 : "${CLAUDEEP_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
 : "${CLAUDEEP_API_KEY_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/claudeep/api-key}"
@@ -26,15 +30,22 @@ die() { printf 'claudeep: %s\n' "$*" >&2; exit 1; }
 [ -x "$CLAUDEEP_CLAUDE_BIN" ] \
     || die "claude binary not found at $CLAUDEEP_CLAUDE_BIN (set CLAUDEEP_CLAUDE_BIN)."
 
-# Keep Claude Code's native picker. DeepSeek maps claude-opus* to V4 Pro and
-# claude-sonnet*/claude-haiku* to V4 Flash. Set CLAUDEEP_MODEL to pin an exact
-# model instead (for example, deepseek-v4-pro[1m]).
+# Keep Claude Code's native picker, but bind each tier to a DeepSeek model
+# explicitly. Left unset, the picker's own IDs go to DeepSeek's name heuristic:
+# claude-opus* lands on V4 Pro, while claude-sonnet*/claude-haiku* — and any
+# name it doesn't recognise — fall through to V4 Flash. That made every tier
+# except Opus resolve to Flash, auto mode included.
+# Set CLAUDEEP_MODEL to pin one model outright and bypass the picker.
 model_env=()
 [ -n "$CLAUDEEP_MODEL" ] && model_env+=("ANTHROPIC_MODEL=$CLAUDEEP_MODEL")
 
 exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_BASE_URL="$CLAUDEEP_BASE_URL" \
     ANTHROPIC_AUTH_TOKEN="$api_key" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="$CLAUDEEP_OPUS_MODEL" \
+    ANTHROPIC_DEFAULT_SONNET_MODEL="$CLAUDEEP_SONNET_MODEL" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDEEP_HAIKU_MODEL" \
+    CLAUDE_CODE_SUBAGENT_MODEL="$CLAUDEEP_SUBAGENT_MODEL" \
     ANTHROPIC_SMALL_FAST_MODEL="$CLAUDEEP_SMALL_MODEL" \
     "${model_env[@]}" \
     CLAUDE_CODE_ENABLE_AUTO_MODE=1 \
