@@ -5,6 +5,12 @@ description: Configure ChatGPT Codex authentication, models, reasoning, tools, i
 
 Codex uses the ChatGPT subscription Responses endpoint at `https://chatgpt.com/backend-api/codex/responses`.
 
+OpenAI's Thibault Sottiaux has publicly welcomed using Codex through other coding
+harnesses:
+
+> [Share the recipe. People want to know how to use GPT-5.6 Sol in CC. We don't
+> discriminate on the harness.](https://x.com/thsottiaux/status/2075830097488249060)
+
 ## Account and authentication
 
 Sign in with a **ChatGPT Plus or Pro account**, not OpenAI API credentials.
@@ -54,7 +60,11 @@ WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE,
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 
-`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. It reuses a session connection and sends `previous_response_id` only when the translated request shape and transcript extension are safe. State is in memory, keyed by Claude Code session ID.
+`CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. A valid identity containing only a Claude Code session ID owns the Main continuation for that session. Each valid direct Agent ID owns an independent continuation and reusable WebSocket within the same session. Nested Agents are keyed by their direct child ID; the parent ID is validated but does not become part of the owner key. The proxy sends `previous_response_id` only when the translated request shape and transcript extension are safe, and only on the exact live WebSocket that produced that response.
+
+An absent, malformed, or ambiguous identity does not reject the HTTP request; that request proceeds without continuation or WebSocket reuse. If the originating socket is missing, dead, or has been replaced, the proxy retries once with the full translated input and without the stale response ID. Continuation and connection state is held only in memory and is lost when the proxy restarts.
+
+Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
 
 ## Server compaction
 
@@ -100,7 +110,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 ## OpenAI-compatible APIs
 
-`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, and Cursor models.
+`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.
 
 The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
 

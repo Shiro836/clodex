@@ -5,7 +5,7 @@ use super::model_allowlist::{KIMI_DEFAULT_MODEL, assert_allowed_model, is_k3, re
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_block_to_url, image_source_to_url, normalize_content,
-    read_effort,
+    parallel_tool_calls, read_effort,
 };
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,8 @@ pub struct KimiChatRequest {
     pub tools: Option<Vec<KimiTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<KimiToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub stream: bool,
     pub stream_options: KimiStreamOptions,
     pub max_tokens: u32,
@@ -153,6 +155,7 @@ pub fn translate_request(
         }),
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
+        parallel_tool_calls: parallel_tool_calls(req),
         prompt_cache_key: opts.session_id,
     };
 
@@ -485,7 +488,7 @@ fn push_user_messages(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiUserContentPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -549,7 +552,7 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiToolResultPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -835,6 +838,64 @@ mod tests {
                 assert!(parts[1].get("image_url").is_some());
             }
             _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn user_content_parts_carry_a_type_discriminant() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "xyz"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        match &translated.messages[0] {
+            KimiMessage::User { content, .. } => {
+                let parts = content.as_array().unwrap();
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
+                );
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn tool_result_parts_carry_a_type_discriminant() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "text", "text": "caption"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    ]
+                }]
+            }]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        match &translated.messages[0] {
+            KimiMessage::Tool { content, .. } => {
+                let parts = content.as_array().unwrap();
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
+                );
+            }
+            _ => panic!("expected Tool message"),
         }
     }
 

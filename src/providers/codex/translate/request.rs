@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    read_effort,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -428,12 +429,37 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(req, opts, true)
+}
+
+pub fn translate_openai_compatible_request(
+    req: &MessagesRequest,
+    model: String,
+    session_id: Option<String>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(
+        req,
+        TranslateOptions {
+            session_id,
+            service_tier: None,
+            model,
+            use_responses_lite: false,
+        },
+        false,
+    )
+}
+
+fn translate_request_inner(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    apply_codex_config: bool,
+) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
-    let parallel_tool_calls = !disable_parallel_tool_use(req);
+    let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -519,15 +545,22 @@ pub fn translate_request(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier)?;
-    if let Some(ref tier) = service_tier {
-        out.service_tier = Some(tier.clone());
+    if apply_codex_config {
+        let service_tier = resolve_service_tier(opts.service_tier)?;
+        if let Some(ref tier) = service_tier {
+            out.service_tier = Some(tier.clone());
+        }
     }
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = resolve_effort(codex_effort)?;
-    if is_compact
+    let mut resolved_effort = if apply_codex_config {
+        resolve_effort(codex_effort)?
+    } else {
+        codex_effort
+    };
+    if apply_codex_config
+        && is_compact
         && let Some(cap) = compact_effort_cap()
         && resolved_effort.as_ref().is_some_and(|e| *e > cap)
     {
@@ -535,7 +568,8 @@ pub fn translate_request(
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
-            && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
+            && (!apply_codex_config
+                || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
             Some("auto".to_string())
         } else {
@@ -752,15 +786,6 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         }
         _ => Ok(None),
     }
-}
-
-fn disable_parallel_tool_use(req: &MessagesRequest) -> bool {
-    req.extra
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("disable_parallel_tool_use"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {

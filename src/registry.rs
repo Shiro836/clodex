@@ -50,7 +50,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
-pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
+pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6"];
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -74,6 +74,10 @@ impl Registry {
                 .map(|model| (*model).to_string())
                 .collect(),
         );
+        models.insert(
+            "opencode".into(),
+            crate::providers::opencode::advertised_models(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -82,6 +86,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -306,7 +311,6 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
-
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
@@ -397,5 +401,48 @@ mod tests {
                 .name(),
             "cursor"
         );
+    }
+
+    #[test]
+    fn opencode_models_route_without_stealing_existing_provider_ids() {
+        let registry = Registry::new(AliasProvider::Codex);
+        assert_eq!(
+            registry
+                .provider_for_model("kimi-k2.7-code", None)
+                .unwrap()
+                .name(),
+            "opencode"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("opencode-go/kimi-k2.6", None)
+                .unwrap()
+                .name(),
+            "opencode"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("kimi-k2.6", None)
+                .unwrap()
+                .name(),
+            "kimi"
+        );
+        for (model, owner) in [
+            ("gpt-5.6-luna", "codex"),
+            ("grok-4.5", "grok"),
+            ("kimi-k3", "kimi"),
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                owner
+            );
+            assert_eq!(
+                registry
+                    .provider_for_model(&format!("opencode-go/{model}"), None)
+                    .unwrap()
+                    .name(),
+                "opencode"
+            );
+        }
     }
 }

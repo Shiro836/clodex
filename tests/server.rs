@@ -8,13 +8,14 @@ use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
+    request_identity::ConversationIdentity,
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
         bind_proxy_listener,
     },
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -95,6 +96,149 @@ impl Provider for FakeProvider {
     }
 }
 
+struct TranslatingProvider {
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+}
+
+#[async_trait]
+impl Provider for TranslatingProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.model.to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn generate_anthropic_stream(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> Result<Generation, ProviderError> {
+        let translated = match self.name {
+            "kimi" => serde_json::to_value(
+                claude_code_proxy::providers::kimi::translate::request::translate_request(
+                    &body,
+                    claude_code_proxy::providers::kimi::translate::request::TranslateOptions {
+                        session_id: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            "grok" => serde_json::to_value(
+                claude_code_proxy::providers::grok::translate::request::translate_request(
+                    &body,
+                    self.model.to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        };
+        *self.captured.lock().unwrap() = Some(translated);
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        Ok(Generation {
+            body: GenerationBody::BufferedSse(sse.into()),
+            resolved_model: self.model.to_string(),
+        })
+    }
+}
+
+fn translating_registry(
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Option<Value>>>,
+) -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Kimi,
+        vec![Arc::new(TranslatingProvider {
+            name,
+            model,
+            captured,
+        }) as Arc<dyn Provider>],
+    ))
+}
+
+type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
+
+struct IdentityCaptureProvider {
+    captured: Arc<Mutex<Vec<CapturedIdentity>>>,
+}
+
+#[async_trait]
+impl Provider for IdentityCaptureProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "legacy path").into_response()
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> axum::response::Response {
+        self.captured
+            .lock()
+            .unwrap()
+            .push((conversation_identity, ctx.session_id));
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::OK, "counted").into_response()
+    }
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -113,6 +257,142 @@ fn routed_registry() -> Arc<Registry> {
             }),
         ],
     ))
+}
+
+async fn call_identity_ingress(
+    app: &axum::Router,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn messages_ingress_forwards_only_strict_conversation_identity() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [provider],
+    )));
+    let normal_body = || {
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    };
+
+    let cases = [
+        (
+            vec![("x-claude-code-session-id", "session-main")],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-agent"),
+                ("x-claude-code-agent-id", "agent-direct"),
+            ],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-nested"),
+                ("x-claude-code-agent-id", "agent-child"),
+                ("x-claude-code-parent-agent-id", "agent-parent"),
+            ],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-malformed-agent"),
+                ("x-claude-code-agent-id", "malformed agent"),
+            ],
+            normal_body(),
+        ),
+        (vec![], normal_body()),
+        (
+            vec![("x-claude-code-session-id", " \tsession-trimmed\t ")],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-auto-review"),
+                ("x-claude-code-agent-id", "agent-auto-review"),
+            ],
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "review"}],
+                "system": [{
+                    "type": "text",
+                    "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
+                }]
+            }),
+        ),
+    ];
+
+    for (headers, body) in cases {
+        assert_eq!(
+            call_identity_ingress(&app, "/v1/messages", &headers, body).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages/count_tokens",
+            &[("x-claude-code-session-id", "session-count")],
+            normal_body(),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![
+            (
+                Some(ConversationIdentity::Main("session-main".to_string())),
+                Some("session-main".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "session-agent".to_string(),
+                    "agent-direct".to_string(),
+                )),
+                Some("session-agent".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "session-nested".to_string(),
+                    "agent-child".to_string(),
+                )),
+                Some("session-nested".to_string()),
+            ),
+            (None, Some("session-malformed-agent".to_string())),
+            (None, None),
+            (
+                Some(ConversationIdentity::Main("session-trimmed".to_string())),
+                Some(" \tsession-trimmed\t ".to_string()),
+            ),
+            (None, Some("session-auto-review".to_string())),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -757,6 +1037,59 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
 }
 
 #[tokio::test]
+async fn openai_routes_preserve_serial_tool_calls_upstream() {
+    for (provider, model, uri, body, expected_choice) in [
+        (
+            "kimi",
+            "kimi-k2.6",
+            "/v1/chat/completions",
+            json!({
+                "model":"kimi-k2.6",
+                "messages":[{"role":"user","content":"look up x"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "parallel_tool_calls":false
+            }),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ),
+        (
+            "grok",
+            "grok-4.5",
+            "/v1/responses",
+            json!({
+                "model":"grok-4.5",
+                "input":"look up x",
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                "tool_choice":"none",
+                "parallel_tool_calls":false
+            }),
+            json!("none"),
+        ),
+    ] {
+        let captured = Arc::new(Mutex::new(None));
+        let response = app_with_options(
+            translating_registry(provider, model, captured.clone()),
+            None,
+            true,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body_string(&body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let translated = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(translated["parallel_tool_calls"], false);
+        assert_eq!(translated["tool_choice"], expected_choice);
+    }
+}
+
+#[tokio::test]
 async fn routed_openai_streams_use_surface_specific_events() {
     let chat = app_with_options(routed_registry(), None, true)
         .oneshot(
@@ -1025,6 +1358,7 @@ async fn models_endpoint_lists_supported_models() {
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"grok-4.6"));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());
