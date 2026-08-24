@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
@@ -63,6 +63,16 @@ impl EnvGuard {
         let previous = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    /// Ensure a variable is absent for the duration of a test, restoring
+    /// whatever was there on drop.
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
         }
         Self { key, previous }
     }
@@ -2858,4 +2868,204 @@ async fn smoke_local_unreachable_server_reports_bad_gateway() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+// ---------------------------------------------------------------------------
+// Local backend, context-window budgeting. vLLM rejects a request whose prompt
+// plus max_tokens exceeds the window instead of clamping it, which used to kill
+// every long analysis turn (Claude Code always asks for 64000 output tokens).
+// ---------------------------------------------------------------------------
+
+/// Mock local server that answers /tokenize with `prompt_tokens` and rejects
+/// any /v1/chat/completions whose max_tokens does not fit `context`, the way
+/// vLLM does — including the exact wording the retry parses.
+async fn spawn_local_upstream_with_window(
+    context: u32,
+    prompt_tokens: u32,
+    serve_tokenize: bool,
+    seen: Arc<Mutex<Vec<Value>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The OpenAI surface lives under /v1 and /tokenize sits beside it, exactly
+    // as vLLM and llama.cpp lay them out.
+    let addr_str = format!("http://{addr}/v1");
+
+    let app = axum::Router::new()
+        .route(
+            "/tokenize",
+            axum::routing::post(move || async move {
+                if serve_tokenize {
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({"count": prompt_tokens, "max_model_len": context})),
+                    )
+                        .into_response()
+                } else {
+                    (StatusCode::NOT_FOUND, "no tokenizer here").into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    let request: Value = serde_json::from_str(&body).unwrap_or_default();
+                    let requested = request["max_tokens"].as_u64().unwrap_or(0) as u32;
+                    let _ = seen.lock().map(|mut guard| guard.push(request));
+                    if prompt_tokens + requested > context {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": {"message": format!(
+                                "This model's maximum context length is {context} tokens. \
+                                 However, you requested {requested} output tokens and your prompt \
+                                 contains at least {prompt_tokens} input tokens. Please reduce the \
+                                 length of the messages or completion.",
+                            ), "type": "BadRequestError", "code": 400}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [(http::header::CONTENT_TYPE, "text/event-stream")],
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"fits\"}}]}\n\n",
+                            "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    addr_str
+}
+
+/// A long analysis turn: 67073 tokens of prompt in a 131072 window, with Claude
+/// Code asking for its usual 64000 output tokens. Before the clamp this was a
+/// hard 400.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_clamps_max_tokens_to_the_context_window() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_local_upstream_with_window(131_072, 67_073, true, seen.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", &upstream);
+    let _model_env = EnvGuard::set("CCP_LOCAL_MODEL", "qwen3.8-27b");
+    let _context_env = EnvGuard::set("CCP_LOCAL_CONTEXT", "131072");
+
+    let response = call_messages_body_as_session(
+        json!({
+            "model": "opus",
+            "max_tokens": 64000,
+            "messages": [{"role":"user","content":"review the whole repo"}]
+        }),
+        "smoke-local-clamp",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the clamp must land the request on the first try, with no retry"
+    );
+    assert_eq!(
+        requests[0]["max_tokens"], 63_487,
+        "max_tokens must be context - prompt - reserve, not the requested 64000"
+    );
+}
+
+/// Same overflow, but the tokenizer endpoint is missing (an older llama.cpp
+/// build, say) so the byte estimate misjudges the prompt. The server's own 400
+/// then carries the real numbers and the request is retried exactly once.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_retries_once_on_a_context_length_rejection() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    // No /tokenize, and no CCP_LOCAL_CONTEXT either: nothing to clamp against,
+    // so only the reactive layer can rescue this.
+    let upstream = spawn_local_upstream_with_window(131_072, 67_073, false, seen.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", &upstream);
+    let _model_env = EnvGuard::set("CCP_LOCAL_MODEL", "qwen3.8-27b");
+    let _context_env = EnvGuard::remove("CCP_LOCAL_CONTEXT");
+
+    let response = call_messages_body_as_session(
+        json!({
+            "model": "opus",
+            "max_tokens": 64000,
+            "messages": [{"role":"user","content":"review the whole repo"}]
+        }),
+        "smoke-local-retry",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "one rejected attempt, then one retry");
+    assert_eq!(requests[0]["max_tokens"], 64_000);
+    assert_eq!(
+        requests[1]["max_tokens"], 63_743,
+        "the retry must use context - input - reserve from the server's message"
+    );
+}
+
+/// When the prompt itself fills the window there is nothing to clamp to, and
+/// the caller is told in the wording Claude Code compacts on.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_prompt_that_cannot_fit_reports_prompt_too_long() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_local_upstream_with_window(131_072, 130_900, true, seen.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", &upstream);
+    let _model_env = EnvGuard::set("CCP_LOCAL_MODEL", "qwen3.8-27b");
+    let _context_env = EnvGuard::set("CCP_LOCAL_CONTEXT", "131072");
+
+    let response = call_messages_body_as_session(
+        json!({
+            "model": "opus",
+            "max_tokens": 64000,
+            "messages": [{"role":"user","content":"review the whole repo"}]
+        }),
+        "smoke-local-too-long",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("prompt is too long"),
+        "message must be the one Claude Code compacts on, got: {message}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a prompt that cannot fit must not be sent upstream at all"
+    );
 }

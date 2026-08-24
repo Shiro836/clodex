@@ -55,6 +55,7 @@ struct LocalConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub context: Option<u32>,
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
 }
@@ -316,6 +317,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_LOCAL_MODEL") {
         out.push("local.model (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_CONTEXT") {
+        out.push("local.context (env)".to_string());
     }
     if env.contains_key("CCP_LOCAL_API_KEY") {
         out.push("local.apiKey (env)".to_string());
@@ -579,6 +583,25 @@ pub fn local_model() -> String {
         return model;
     }
     LOCAL_DEFAULT_MODEL.to_string()
+}
+
+/// Size of the local server's context window, in tokens.
+///
+/// vLLM refuses a request whose prompt + `max_tokens` exceeds this instead of
+/// clamping it, so the provider needs the number to do the clamping itself.
+/// Unset means "unknown": only the reactive retry protects the request then.
+pub fn local_context() -> Option<u32> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_LOCAL_CONTEXT") {
+        return raw.trim().parse::<u32>().ok().filter(|value| *value > 0);
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(local) = file.local
+    {
+        return local.context.filter(|value| *value > 0);
+    }
+    None
 }
 
 pub fn local_api_key() -> Option<String> {

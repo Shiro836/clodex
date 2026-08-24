@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod client;
 pub mod stream;
 
@@ -22,7 +23,11 @@ use crate::provider::{
 use crate::providers::{kimi::count_tokens, opencode::chat};
 use crate::registry::{is_anthropic_alias, normalize_incoming_model};
 
-use self::client::{LocalClient, LocalError};
+use self::budget::{
+    Clamp, PROACTIVE_RESERVE, clamp_max_tokens, estimate_tokens_from_bytes,
+    parse_context_length_error, prompt_too_long_message, retry_max_tokens,
+};
+use self::client::{LocalClient, LocalError, LocalResponse};
 
 /// Model id advertised for people who want to address the local backend
 /// explicitly instead of going through an Anthropic alias.
@@ -41,6 +46,10 @@ enum ClientState {
 pub struct LocalProvider {
     client: ClientState,
     model: String,
+    /// Size of the server's context window (`CCP_LOCAL_CONTEXT`), when known.
+    /// Without it there is nothing to clamp against and only the reactive
+    /// retry can save an oversized request.
+    context: Option<u32>,
 }
 
 impl LocalProvider {
@@ -53,7 +62,117 @@ impl LocalProvider {
         .map(Arc::new)
         .map(ClientState::Ready)
         .unwrap_or_else(|error| ClientState::Invalid(error.to_string()));
-        Self { client, model }
+        Self {
+            client,
+            model,
+            context: crate::config::local_context(),
+        }
+    }
+
+    /// Translate, fit the request to the context window, and send it.
+    ///
+    /// Two layers, because neither alone is enough: the proactive clamp needs a
+    /// context size and a tokenizer that may not answer, and the reactive retry
+    /// only fires after a round trip. Together they mean Claude Code's fixed
+    /// 64K output appetite never sinks a long prompt.
+    async fn post_fitted(
+        &self,
+        client: &LocalClient,
+        body: &MessagesRequest,
+        resolved: &str,
+        ctx: &RequestContext,
+    ) -> Result<LocalResponse, ProviderError> {
+        let log = crate::logging::create_logger("local");
+        let mut translated =
+            chat::prepare_request(body, resolved).map_err(invalid_request_provider_error)?;
+
+        if let Some(context) = self.context {
+            let counted = client.count_prompt_tokens(&translated).await;
+            let exact = counted.is_some();
+            let prompt_tokens = counted.unwrap_or_else(|| {
+                estimate_tokens_from_bytes(
+                    serde_json::to_string(&translated)
+                        .map(|body| body.len())
+                        .unwrap_or_default(),
+                )
+            });
+            match clamp_max_tokens(
+                translated.max_tokens,
+                context,
+                prompt_tokens,
+                PROACTIVE_RESERVE,
+            ) {
+                Clamp::Unchanged => {}
+                Clamp::Clamped(limit) => {
+                    log.info(
+                        "local_max_tokens_clamped",
+                        Some(serde_json::Map::from_iter([
+                            ("reqId".into(), ctx.req_id.clone().into()),
+                            ("requested".into(), translated.max_tokens.into()),
+                            ("clamped".into(), limit.into()),
+                            ("promptTokens".into(), prompt_tokens.into()),
+                            ("exact".into(), exact.into()),
+                            ("context".into(), context.into()),
+                        ])),
+                    );
+                    translated.max_tokens = limit;
+                }
+                Clamp::PromptTooLong {
+                    prompt_tokens,
+                    context,
+                } if exact => {
+                    return Err(ProviderError::new(
+                        StatusCode::BAD_REQUEST,
+                        ProviderErrorKind::InvalidRequest,
+                        prompt_too_long_message(prompt_tokens, context),
+                    ));
+                }
+                // The estimate says it will not fit, but the estimate is crude.
+                // Ask for the smallest useful answer and let the server rule.
+                Clamp::PromptTooLong { .. } => {
+                    translated.max_tokens = budget::MIN_USABLE_OUTPUT;
+                }
+            }
+        }
+
+        let first = client
+            .post_chat_completions(&translated, true, ctx.traffic.clone())
+            .await;
+        let error = match first {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+
+        // Reactive layer: the server just told us the exact numbers, so retry
+        // once with a request that provably fits.
+        let Some(parsed) = (error.status == StatusCode::BAD_REQUEST)
+            .then(|| parse_context_length_error(&error.message))
+            .flatten()
+        else {
+            return Err(local_provider_error(error));
+        };
+        let Some(limit) = retry_max_tokens(&parsed) else {
+            return Err(ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                prompt_too_long_message(parsed.input_tokens, parsed.context),
+            ));
+        };
+        log.warn(
+            "local_max_tokens_retry",
+            Some(serde_json::Map::from_iter([
+                ("reqId".into(), ctx.req_id.clone().into()),
+                ("requested".into(), translated.max_tokens.into()),
+                ("retryWith".into(), limit.into()),
+                ("inputTokens".into(), parsed.input_tokens.into()),
+                ("context".into(), parsed.context.into()),
+            ])),
+        );
+        translated.max_tokens = limit;
+        client
+            .post_chat_completions(&translated, true, ctx.traffic.clone())
+            .await
+            .map_err(local_provider_error)
     }
 
     fn client(&self) -> Result<Arc<LocalClient>, String> {
@@ -94,19 +213,12 @@ impl LocalProvider {
         };
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
-        let translated = match chat::prepare_request(&body, &resolved) {
-            Ok(translated) => translated,
-            Err(error) => return invalid_request_response(error),
-        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match client
-            .post_chat_completions(&translated, true, ctx.traffic.clone())
-            .await
-        {
+        let upstream = match self.post_fitted(&client, &body, &resolved, &ctx).await {
             Ok(upstream) => upstream,
-            Err(error) => return map_error(error),
+            Err(error) => return map_provider_error(error),
         };
         let bytes = match upstream.into_bytes().await {
             Ok(bytes) => bytes,
@@ -215,12 +327,7 @@ impl Provider for LocalProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let translated =
-            chat::prepare_request(&body, &resolved).map_err(invalid_request_provider_error)?;
-        let upstream = client
-            .post_chat_completions(&translated, true, ctx.traffic.clone())
-            .await
-            .map_err(local_provider_error)?;
+        let upstream = self.post_fitted(&client, &body, &resolved, &ctx).await?;
         let body = stream::stream_body(
             upstream,
             message_id,
@@ -276,14 +383,6 @@ fn invalid_configuration_response(error: impl std::fmt::Display) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "api_error",
         format!("Invalid local provider configuration: {error}"),
-    )
-}
-
-fn invalid_request_response(error: impl std::fmt::Display) -> Response {
-    json_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_request_error",
-        error.to_string(),
     )
 }
 
@@ -356,6 +455,7 @@ mod tests {
         LocalProvider {
             client: ClientState::Invalid("unused".into()),
             model: model.to_string(),
+            context: None,
         }
     }
 
