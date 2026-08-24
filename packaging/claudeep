@@ -12,10 +12,10 @@ set -euo pipefail
 : "${CLAUDEEP_MODEL:=}"
 : "${CLAUDEEP_FABLE_MODEL:=deepseek-v4-pro}"
 : "${CLAUDEEP_OPUS_MODEL:=deepseek-v4-pro}"
-: "${CLAUDEEP_SONNET_MODEL:=deepseek-v4-flash}"
-: "${CLAUDEEP_HAIKU_MODEL:=deepseek-v4-flash}"
-: "${CLAUDEEP_SUBAGENT_MODEL:=deepseek-v4-flash}"
-: "${CLAUDEEP_SMALL_MODEL:=deepseek-v4-flash}"
+: "${CLAUDEEP_SONNET_MODEL:=deepseek-v4-flash-vision-exp}"
+: "${CLAUDEEP_HAIKU_MODEL:=deepseek-v4-flash-vision-exp}"
+: "${CLAUDEEP_SUBAGENT_MODEL:=deepseek-v4-flash-vision-exp}"
+: "${CLAUDEEP_SMALL_MODEL:=deepseek-v4-flash-vision-exp}"
 : "${CLAUDEEP_MAX_CONTEXT_TOKENS:=1000000}"
 : "${CLAUDEEP_AUTO_COMPACT_WINDOW:=786432}"
 : "${CLAUDEEP_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
@@ -34,18 +34,23 @@ die() { printf 'claudeep: %s\n' "$*" >&2; exit 1; }
     || die "claude binary not found at $CLAUDEEP_CLAUDE_BIN (set CLAUDEEP_CLAUDE_BIN)."
 
 # Keep Claude Code's native picker, but bind each tier to a DeepSeek model
-# explicitly: Fable and Opus to V4 Pro, Sonnet and Haiku to V4 Flash. Left
-# unset, the picker's own IDs go to DeepSeek's name heuristic, which resolves
-# any name it doesn't recognise — claude-fable-5 included — to V4 Flash.
-# Set CLAUDEEP_MODEL to pin one model outright and bypass the picker.
+# explicitly: Fable and Opus to V4 Pro, Sonnet and Haiku to V4 Flash Vision.
+# Left unset, the picker's own IDs go to DeepSeek's name heuristic, which
+# resolves any name it doesn't recognise — claude-fable-5 included — to
+# text-only V4 Flash. Flash and Pro reject images with 400; only
+# deepseek-v4-flash-vision-exp accepts them. Vision matches Flash on text
+# price and quality, so it is the Flash-tier default. Opus stays on Pro;
+# set CLAUDEEP_OPUS_MODEL / CLAUDEEP_FABLE_MODEL to the vision id if those
+# tiers should accept images too. Set CLAUDEEP_MODEL to pin one model
+# outright and bypass the picker.
 #
-# Both V4 models are natively 1M-context and take the full window with no beta
-# header and no [1m] suffix on the wire — measured at 294,741 input tokens on
-# deepseek-v4-pro. A bare deepseek-v4-* ID matches no Claude pattern, though,
-# so Claude Code would assume a smaller window and compact early. Because the
-# ID neither starts with "claude-" nor carries a [1m] suffix,
-# CLAUDE_CODE_MAX_CONTEXT_TOKENS applies directly and proactive compaction
-# runs at the declared window.
+# All three V4 models are natively 1M-context and take the full window with
+# no beta header and no [1m] suffix on the wire — measured at 294,741 input
+# tokens on deepseek-v4-pro. A bare deepseek-v4-* ID matches no Claude
+# pattern, though, so Claude Code would assume a smaller window and compact
+# early. Because the ID neither starts with "claude-" nor carries a [1m]
+# suffix, CLAUDE_CODE_MAX_CONTEXT_TOKENS applies directly and proactive
+# compaction runs at the declared window.
 #
 # Keep the model names bare. DeepSeek does accept deepseek-v4-pro[1m] (it
 # strips the suffix and serves Pro), but on Claude Code's side that suffix

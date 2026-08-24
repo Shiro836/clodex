@@ -88,8 +88,13 @@ Both launchers keep Claude Code's native Opus/Sonnet/Haiku picker.
 | Claude Code picker | `clodex` | `claudeep` |
 |--------------------|----------|------------|
 | Opus   | `gpt-5.6-sol` | `deepseek-v4-pro` |
-| Sonnet | `gpt-5.6-terra` | `deepseek-v4-flash` |
-| Haiku  | `gpt-5.6-luna` | `deepseek-v4-flash` |
+| Sonnet | `gpt-5.6-terra` | `deepseek-v4-flash-vision-exp` |
+| Haiku  | `gpt-5.6-luna` | `deepseek-v4-flash-vision-exp` |
+
+Sonnet, Haiku, and subagents use DeepSeek's vision model so pasted images and
+screenshots work. Opus stays on V4 Pro, which is text-only and returns 400 on
+images — set `CLAUDEEP_OPUS_MODEL=deepseek-v4-flash-vision-exp` if you want
+vision there too.
 
 DeepSeek performs its Claude-name mapping at the API endpoint. Neither launcher
 pins the startup model by default, so the picker stays intact.
