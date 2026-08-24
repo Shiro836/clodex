@@ -90,6 +90,13 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_as_session(body, "smoke-session").await
+}
+
+/// Same as [`call_messages_body`], with an explicit session id. Alias routing
+/// (`opus`/`sonnet`/…) is sticky per session, so a test that asserts which
+/// provider an alias lands on needs a session no other test has touched.
+async fn call_messages_body_as_session(body: Value, session_id: &str) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app(Arc::new(Registry::with_default_alias()))
         .oneshot(
@@ -97,7 +104,7 @@ async fn call_messages_body(body: Value) -> Response {
                 .method(Method::POST)
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
+                .header("x-claude-code-session-id", session_id)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -2693,4 +2700,162 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     );
     traffic_file(&files, "032-upstream-response-body.sse");
     traffic_file(&files, "040-upstream-event.json");
+}
+
+// ---------------------------------------------------------------------------
+// Local backend smoke: a self-hosted OpenAI-compatible server (vLLM /
+// llama.cpp) reached over CCP_LOCAL_BASE_URL, with Anthropic aliases routed to
+// it through CCP_ALIAS_PROVIDER=local.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_messages_uses_mock_upstream() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing it\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"local ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", &upstream);
+    let _model_env = EnvGuard::set("CCP_LOCAL_MODEL", "qwen3.8-27b");
+    // An Anthropic alias must reach the local backend, the way Claude Code's
+    // own model picker addresses it.
+    let response = call_messages_body_as_session(
+        json!({
+            "model": "opus",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+        "smoke-local-buffered",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["type"], "thinking");
+    assert_eq!(value["content"][0]["thinking"], "weighing it");
+    assert_eq!(value["content"][1]["type"], "text");
+    assert_eq!(value["content"][1]["text"], "local ok");
+
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        sent["model"], "qwen3.8-27b",
+        "the alias must be replaced by the configured local model id"
+    );
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_stream_maps_reasoning_tools_and_usage() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan it\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"/tmp/x\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", &upstream);
+    let _model_env = EnvGuard::set("CCP_LOCAL_MODEL", "qwen3.8-27b");
+    let response = call_messages_body_as_session(
+        json!({
+        "model": "sonnet",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"read a file"}],
+        "tools": [{
+            "name": "Read",
+            "description": "read a file",
+            "input_schema": {"type":"object","properties":{"path":{"type":"string"}}}
+        }]
+        }),
+        "smoke-local-stream",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("local stream must finish")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert!(text.contains("thinking_delta"), "stream body: {text}");
+    assert!(text.contains("\"plan it\""), "stream body: {text}");
+    assert!(text.contains("input_json_delta"), "stream body: {text}");
+    assert!(
+        text.contains("\"stop_reason\":\"tool_use\""),
+        "stream body: {text}"
+    );
+    assert_eq!(text.matches("event: message_start").count(), 1);
+
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["tools"][0]["function"]["name"], "Read");
+    assert_eq!(sent["tools"][0]["type"], "function");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_local_unreachable_server_reports_bad_gateway() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "local");
+    // Port 1 is never listening, so this exercises the "server is not up yet"
+    // path the clauqwen wrappers guard against.
+    let _base_url_env = EnvGuard::set("CCP_LOCAL_BASE_URL", "http://127.0.0.1:1/v1");
+    let response = call_messages_body_as_session(
+        json!({
+            "model": "opus",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+        "smoke-local-unreachable",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }

@@ -9,6 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
+    Local,
 }
 
 impl AliasProvider {
@@ -16,6 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
+            AliasProvider::Local => "local",
         }
     }
 }
@@ -45,6 +47,16 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub local: Option<LocalConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct LocalConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -124,6 +136,7 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        "local" => Some(AliasProvider::Local),
         _ => None,
     }
 }
@@ -297,6 +310,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_BASE_URL") {
+        out.push("local.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_MODEL") {
+        out.push("local.model (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_API_KEY") {
+        out.push("local.apiKey (env)".to_string());
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
@@ -520,6 +542,57 @@ pub fn opencode_base_url() -> String {
 
 pub fn is_verbose() -> bool {
     log_verbose()
+}
+
+// ---------------------------------------------------------------------------
+// Local (self-hosted OpenAI-compatible server) config
+// ---------------------------------------------------------------------------
+
+pub const LOCAL_DEFAULT_BASE_URL: &str = "http://127.0.0.1:8000/v1";
+pub const LOCAL_DEFAULT_MODEL: &str = "qwen3.8-27b";
+
+pub fn local_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_LOCAL_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(local) = file.local
+        && let Some(url) = local.base_url
+    {
+        return url;
+    }
+    LOCAL_DEFAULT_BASE_URL.to_string()
+}
+
+pub fn local_model() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_LOCAL_MODEL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(local) = file.local
+        && let Some(model) = local.model
+    {
+        return model;
+    }
+    LOCAL_DEFAULT_MODEL.to_string()
+}
+
+pub fn local_api_key() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_LOCAL_API_KEY") {
+        return Some(raw.clone());
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(local) = file.local
+    {
+        return local.api_key;
+    }
+    None
 }
 
 pub fn kimi_oauth_host() -> String {

@@ -78,6 +78,7 @@ impl Registry {
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
+        models.insert("local".into(), crate::providers::local::advertised_models());
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -87,6 +88,7 @@ impl Registry {
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
                 "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
+                "local" => Arc::new(crate::providers::local::LocalProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -352,6 +354,28 @@ mod tests {
         let p = registry.provider_for_model("haiku", None);
         assert!(p.is_some());
         assert_eq!(p.expect("provider").name(), "kimi");
+    }
+
+    #[test]
+    fn aliases_route_to_local_provider_when_selected() {
+        let registry = Registry::new(AliasProvider::Local);
+        for model in ["opus", "sonnet", "haiku", "fable", "claude-opus-5"] {
+            let provider = registry.provider_for_model(model, None);
+            assert_eq!(
+                provider.expect("provider").name(),
+                "local",
+                "{model} should route to the local backend"
+            );
+        }
+    }
+
+    #[test]
+    fn local_model_id_routes_to_local_provider() {
+        let registry = Registry::new(AliasProvider::Codex);
+        assert_eq!(
+            registry.provider_for_model("local", None).unwrap().name(),
+            "local"
+        );
     }
 
     #[test]
