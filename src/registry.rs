@@ -22,6 +22,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-1",
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
@@ -208,7 +209,21 @@ pub fn normalize_incoming_model(model: &str) -> String {
 }
 
 pub fn is_anthropic_alias(model: &str) -> bool {
-    ANTHROPIC_STYLE_ALIASES.contains(&model)
+    ANTHROPIC_STYLE_ALIASES.contains(&model) || anthropic_alias_family(model).is_some()
+}
+
+/// Tier word of a full Claude model id (`claude-fable-5-1` -> `fable`), so ids
+/// that Claude Code ships later still route to the alias provider and resolve
+/// to the tier's mapped model without a table update.
+pub fn anthropic_alias_family(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    let rest = lower.strip_prefix("claude-").unwrap_or(&lower);
+    ["fable", "opus", "sonnet", "haiku"]
+        .into_iter()
+        .find(|family| {
+            rest.strip_prefix(family)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with('-'))
+        })
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
@@ -377,6 +392,31 @@ mod tests {
             registry.provider_for_model("local", None).unwrap().name(),
             "local"
         );
+    }
+
+    #[test]
+    fn unknown_claude_ids_route_by_family() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in [
+            "claude-fable-5-1",
+            "fable-5",
+            "claude-opus-5-1",
+            "claude-sonnet-5-2[1m]",
+            "claude-haiku-5",
+        ] {
+            assert_eq!(
+                registry
+                    .provider_for_model(model, None)
+                    .expect("provider")
+                    .name(),
+                "codex",
+                "{model} should route via its family"
+            );
+        }
+        assert_eq!(anthropic_alias_family("claude-fable-5-1"), Some("fable"));
+        assert_eq!(anthropic_alias_family("fable-5"), Some("fable"));
+        assert_eq!(anthropic_alias_family("gpt-6-astra"), None);
+        assert_eq!(anthropic_alias_family("fabled-thing"), None);
     }
 
     #[test]

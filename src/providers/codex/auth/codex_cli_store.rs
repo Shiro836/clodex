@@ -84,7 +84,9 @@ fn jwt_exp_ms(token: &str) -> Option<u64> {
 fn rfc3339_now() -> String {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
-    OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 impl AuthStorage<StoredAuth> for CodexCliAuthStore {
@@ -222,8 +224,7 @@ mod tests {
             })
             .unwrap();
 
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["tokens"]["access_token"], "new-access");
         assert_eq!(raw["tokens"]["refresh_token"], "new-refresh");
         assert_eq!(raw["tokens"]["account_id"], "acct_2");

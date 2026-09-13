@@ -30,7 +30,24 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-5", "gpt-5.6-sol"),
     ("fable", "gpt-6-astra"),
     ("claude-fable-5", "gpt-6-astra"),
+    ("claude-fable-5-1", "gpt-6-astra"),
 ];
+
+/// Alias target for `model`: an exact table hit, else the entry for its Claude
+/// tier word (see `registry::anthropic_alias_family`).
+pub fn alias_target(model: &str) -> Option<&'static str> {
+    let exact = MODEL_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == model)
+        .map(|(_, target)| *target);
+    exact.or_else(|| {
+        let family = crate::registry::anthropic_alias_family(model)?;
+        MODEL_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == family)
+            .map(|(_, target)| *target)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
@@ -66,11 +83,7 @@ pub fn resolve_model_request_with_config_override(
     model: &str,
     apply_config_override: bool,
 ) -> ResolvedModel {
-    let alias = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == model)
-        .map(|(_, target)| *target)
-        .unwrap_or(model);
+    let alias = alias_target(model).unwrap_or(model);
 
     let requested = resolve_fast_model_alias(alias);
 
@@ -144,7 +157,7 @@ pub fn is_valid_model_for_codex(model: &str) -> bool {
     if fast_set.contains(model) {
         return true;
     }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    alias_target(model).is_some()
 }
 
 #[cfg(test)]
@@ -185,7 +198,7 @@ mod tests {
 
     #[test]
     fn opus_aliases_resolve_to_sol() {
-        for model in ["claude-opus-4-8", "claude-opus-5"] {
+        for model in ["claude-opus-4-8", "claude-opus-5", "claude-opus-5-1"] {
             let r = resolve_model_request(model);
             assert_eq!(r.model, "gpt-5.6-sol");
         }
@@ -193,7 +206,13 @@ mod tests {
 
     #[test]
     fn fable_5_resolves_to_astra() {
-        for model in ["fable", "claude-fable-5"] {
+        for model in [
+            "fable",
+            "fable-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-6-3",
+        ] {
             let r = resolve_model_request(model);
             assert_eq!(r.model, "gpt-6-astra");
         }
