@@ -3,6 +3,54 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.39 (2026-09-10)
+
+- OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
+  GLM 5.3 Flash, LongCat 2.0, and Qwen 3.8 Flash. Use `opencode-go/grok-4.6`
+  to select Grok through OpenCode Go.
+  ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- Fix OpenCode Go responses failing when the provider sends a harmless keepalive
+  after completion. ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- OpenCode Go now reports malformed response endings and late connection failures
+  instead of marking affected streamed responses as successful.
+
+## v0.1.38 (2026-09-09)
+
+- Fix requests failing with an invalid Artifact tool schema in Claude Code 2.1.265+
+  when using Codex. ([#141](https://github.com/raine/claude-code-proxy/issues/141),
+  [#142](https://github.com/raine/claude-code-proxy/issues/142))
+
+## v0.1.37 (2026-09-08)
+
+- OpenCode Go requests work again instead of failing with a missing session header
+  error. ([#137](https://github.com/raine/claude-code-proxy/issues/137),
+  [#138](https://github.com/raine/claude-code-proxy/pull/138))
+
+## v0.1.36 (2026-09-06)
+
+- Codex users can select GPT-6 Astra with `gpt-6-astra` or its priority-tier
+  `gpt-6-astra-fast` alias.
+  ([#129](https://github.com/raine/claude-code-proxy/pull/129))
+- Codex conversation continuation stays active after tool calls, avoiding
+  unnecessary full-history uploads and reconnects when continuation is enabled.
+  ([#118](https://github.com/raine/claude-code-proxy/issues/118),
+  [#119](https://github.com/raine/claude-code-proxy/pull/119))
+- Claude Code responses include request IDs, including on errors, so transcript
+  tools can avoid double-counting usage and failed requests are easier to trace.
+  ([#104](https://github.com/raine/claude-code-proxy/issues/104),
+  [#105](https://github.com/raine/claude-code-proxy/pull/105))
+- Nix builds avoid dependency download failures caused by crates.io API rate limits.
+
+## v0.1.35 (2026-08-19)
+
+- Grok web search works reliably with Claude Code, preserves other tools, and
+  renders results across clients.
+  ([#112](https://github.com/raine/claude-code-proxy/pull/112))
+- Grok honors the requested reasoning effort on OpenAI-compatible routes.
+- Codex and OpenCode Go streams handle connection failures, rate-limit updates,
+  and output limits more reliably.
+  ([#103](https://github.com/raine/claude-code-proxy/pull/103))
+
 ## v0.1.34 (2026-08-12)
 
 - Grok users can select Grok 4.6 with the `grok-4.6` model name.

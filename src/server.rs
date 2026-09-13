@@ -1452,7 +1452,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1492,7 +1492,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1547,7 +1547,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Missing model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1634,7 +1634,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Unknown model"),
             );
-            return response;
+            return with_request_id(response, &req_id);
         }
     };
 
@@ -1780,6 +1780,31 @@ async fn dispatch_request(
             format!("HTTP {}", status.as_u16()),
         );
     }
+    with_request_id(response, &req_id)
+}
+
+/// Header Claude Code reads to populate the `requestId` field it writes into
+/// every transcript record.
+const REQUEST_ID_HEADER: &str = "request-id";
+
+/// Publish the per-request id this proxy mints. Anthropic returns `request-id`,
+/// and Claude Code records it as `requestId`; without it every downstream
+/// consumer that de-duplicates transcript records by request id (its own
+/// parser, usage dashboards) counts each request twice, because a transcript
+/// legitimately repeats a record and the id is what resolves it.
+///
+/// An upstream-supplied id is preserved: relabelling a real provider id with a
+/// local uuid would lose the more useful value.
+fn stamp_request_id(headers: &mut http::HeaderMap, req_id: &str) {
+    if !headers.contains_key(REQUEST_ID_HEADER)
+        && let Ok(value) = http::HeaderValue::from_str(req_id)
+    {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+}
+
+fn with_request_id(mut response: Response, req_id: &str) -> Response {
+    stamp_request_id(response.headers_mut(), req_id);
     response
 }
 
@@ -1789,7 +1814,10 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
         .extensions()
         .get::<NativeResponseOutcome>()
         .cloned();
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // Stamped on the parts before the body is streamed, so a streaming SSE
+    // response carries the header too.
+    stamp_request_id(&mut parts.headers, &guard.req_id);
     let stream = futures_util::stream::unfold(
         (body, guard, outcome),
         move |(mut body, mut guard, outcome)| async move {
@@ -2142,6 +2170,71 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod request_id_header_tests {
+    use super::{REQUEST_ID_HEADER, RequestMonitorGuard, monitor_response_body};
+    use axum::body::Body;
+    use axum::response::Response;
+    use http::{HeaderValue, StatusCode};
+
+    fn guard(req_id: &str) -> RequestMonitorGuard {
+        RequestMonitorGuard::new(None, req_id.to_string())
+    }
+
+    // Claude Code populates its transcript `requestId` from this header.
+    // Without it, consumers that de-duplicate transcript records by request id
+    // count every request twice, because a transcript legitimately repeats a
+    // record and the id is what resolves the repeat.
+    #[test]
+    fn stamps_the_request_id_on_a_response() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("{}"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("req-abc-123"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-abc-123"
+        );
+    }
+
+    // Streaming responses carry it too: the header is applied to the parts
+    // before the body is streamed, which is why the body-level message id is
+    // not a substitute for SSE.
+    #[test]
+    fn stamps_a_streaming_response_before_the_body() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from("event: message_start\n"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("req-stream-1"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-stream-1"
+        );
+    }
+
+    // An upstream that already supplied one owns it; overwriting would relabel
+    // a real provider id with a local uuid.
+    #[test]
+    fn does_not_clobber_an_upstream_supplied_id() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                REQUEST_ID_HEADER,
+                HeaderValue::from_static("upstream-owned"),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let stamped = monitor_response_body(response, guard("local-uuid"));
+        assert_eq!(
+            stamped.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "upstream-owned"
+        );
+    }
 }
 
 #[cfg(test)]

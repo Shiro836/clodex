@@ -22,10 +22,7 @@ use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
     RequestContext,
 };
-use crate::providers::{
-    codex::translate::accumulate::accumulate_response as accumulate_responses_response,
-    kimi::count_tokens,
-};
+use crate::providers::kimi::count_tokens;
 
 use self::client::{OpenCodeClient, OpenCodeError};
 use self::model::EndpointKind;
@@ -91,7 +88,13 @@ impl OpenCodeProvider {
                 };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -114,7 +117,13 @@ impl OpenCodeProvider {
                 };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, false, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        false,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -138,7 +147,13 @@ impl OpenCodeProvider {
                     };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -149,7 +164,7 @@ impl OpenCodeProvider {
                     Err(error) => return map_error(error),
                 };
                 capture_buffered_upstream(&ctx, &bytes, "sse");
-                match accumulate_responses_response(&bytes, &message_id, requested) {
+                match responses::accumulate_response(&bytes, &message_id, requested) {
                     Ok(value) => value,
                     Err(error) => return invalid_upstream_response(error),
                 }
@@ -251,7 +266,13 @@ impl Provider for OpenCodeProvider {
                 let translated = chat::prepare_request(&body, spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 chat::stream_body(
@@ -267,7 +288,13 @@ impl Provider for OpenCodeProvider {
                 let translated = messages::prepare_request(&body, spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 messages::stream_body(
@@ -281,7 +308,13 @@ impl Provider for OpenCodeProvider {
                 let translated = responses::prepare_request(&body, spec.id, ctx.session_id.clone())
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 responses::stream_body(
@@ -451,7 +484,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::Body,
-        extract::OriginalUri,
+        extract::{OriginalUri, State},
         http::HeaderMap,
         response::{IntoResponse, Response},
         routing::post,
@@ -460,6 +493,7 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
     use std::convert::Infallible;
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -472,6 +506,68 @@ mod tests {
             monitor: None,
             traffic: None,
         }
+    }
+
+    fn context_with_session(session_id: &str) -> RequestContext {
+        RequestContext {
+            session_id: Some(session_id.to_string()),
+            ..context()
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_session_id_is_forwarded_as_opencode_session_header() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        async fn capture_session_header(
+            State(seen): State<Arc<Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(
+                headers
+                    .get("x-opencode-session")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            Json(json!({
+                "id": "msg_native",
+                "type": "message",
+                "role": "assistant",
+                "model": "minimax-m3",
+                "content": [{"type":"text","text":"hello"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":1,"output_tokens":1}
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/v1/messages", post(capture_session_header))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenCodeProvider::with_client(
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap(),
+        );
+
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "opencode-go/minimax-m3",
+            "stream": false,
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(body, context_with_session("claude-session-42"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.as_slice(), ["claude-session-42"]);
     }
 
     #[tokio::test]
@@ -553,6 +649,29 @@ mod tests {
                 .into_response();
         }
         if uri.path().ends_with("/responses") {
+            if body["max_output_tokens"] == 8 {
+                return (
+                    [(http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_limited\"}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"truncated response\"}\n\n",
+                        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_limited\",\"status\":\"incomplete\",\"error\":null,\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":6,\"output_tokens\":8}}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response();
+            }
+            if body["max_output_tokens"] == 9 {
+                return (
+                    [(http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_filtered\",\"status\":\"incomplete\",\"error\":null,\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response();
+            }
             return (
                 [(http::header::CONTENT_TYPE, "text/event-stream")],
                 concat!(
@@ -684,6 +803,79 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["content"][0]["text"], expected, "model {model}");
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_max_output_tokens_is_a_normal_buffered_completion() {
+        let (provider, server) = mock_provider().await;
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": false,
+            "max_tokens": 8,
+            "messages": [{"role":"user","content":"write a long response"}]
+        }))
+        .unwrap();
+        let response = provider.handle_messages(body, context()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["content"][0]["text"], "truncated response");
+        assert_eq!(value["stop_reason"], "max_tokens");
+        assert_eq!(value["usage"]["output_tokens"], 8);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_max_output_tokens_is_a_normal_streaming_completion() {
+        let (provider, server) = mock_provider().await;
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "opencode-go/gpt-5.6-luna",
+            "max_tokens": 8,
+            "messages": [{"role":"user","content":"write a long response"}]
+        }))
+        .unwrap();
+        let generation = provider
+            .generate_anthropic_stream(body, context())
+            .await
+            .unwrap();
+        let GenerationBody::LiveSse(body) = generation.body else {
+            panic!("OpenCode Go generation must remain live");
+        };
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let output = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(output.contains("truncated response"));
+        assert!(output.contains(r#""stop_reason":"max_tokens""#));
+        assert!(output.contains("event: message_stop"));
+        assert!(!output.contains("event: error"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_content_filter_is_not_misreported_as_max_tokens() {
+        let (provider, server) = mock_provider().await;
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "opencode-go/gpt-5.6-luna",
+            "stream": false,
+            "max_tokens": 9,
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let response = provider.handle_messages(body, context()).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"], "api_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("content_filter")
+        );
         server.abort();
     }
 

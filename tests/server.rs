@@ -516,6 +516,73 @@ async fn unknown_model_returns_400_with_summary() {
     assert!(message.contains("Supported:"));
 }
 
+fn request_id(response: &axum::response::Response) -> &str {
+    response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+async fn messages_response(app: axum::Router, model: &str) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(body_string(
+                &json!({"model": model, "messages": [{"role": "user", "content": "hello"}]})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+// Claude Code populates the `requestId` field of every transcript record from
+// the `request-id` response header. Consumers that de-duplicate those records
+// by request id count each request twice without it, because a transcript
+// legitimately repeats a record and the id is what resolves the repeat.
+#[tokio::test]
+async fn successful_response_carries_a_request_id() {
+    let registry = || {
+        Arc::new(Registry::from_providers(
+            AliasProvider::Codex,
+            [Arc::new(IdentityCaptureProvider {
+                captured: Arc::new(Mutex::new(Vec::new())),
+            }) as Arc<dyn Provider>],
+        ))
+    };
+    let first = messages_response(app(registry()), "gpt-5.5").await;
+    let second = messages_response(app(registry()), "gpt-5.5").await;
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(!request_id(&first).is_empty());
+    assert_ne!(request_id(&first), request_id(&second));
+}
+
+// Errors are de-duplicated by the same key as successes, and a failed turn is
+// the record most worth correlating with a proxy log.
+#[tokio::test]
+async fn rejected_request_carries_a_request_id() {
+    let response =
+        messages_response(app(Arc::new(Registry::with_default_alias())), "not-a-model").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
+}
+
+// A provider that answers with a failure status leaves through a different
+// return path than a success.
+#[tokio::test]
+async fn provider_failure_response_carries_a_request_id() {
+    let response = messages_response(app(routed_registry()), "kimi-k2.6").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(!request_id(&response).is_empty());
+}
+
 #[tokio::test]
 async fn missing_model_returns_400() {
     let app = app(Arc::new(Registry::with_default_alias()));
