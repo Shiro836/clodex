@@ -29,6 +29,14 @@ set -euo pipefail
 # The small/fast (background + subagent-haiku) model DOES need a resolvable id,
 # or those requests 400. claude-haiku-4-5 -> gpt-5.6-luna via the proxy.
 : "${CLODEX_SMALL_MODEL:=claude-haiku-4-5}"
+# Per-tier ids behind the picker rows. The "[1m]" suffix is what makes Claude
+# Code believe the model has a 1M window on a non-Anthropic base URL (see the
+# auto-compact note below); Claude Code strips it before sending, and the proxy
+# strips it again as a fallback. Set one to "" to leave that tier at Claude
+# Code's default (200k believed window).
+: "${CLODEX_FABLE_MODEL=claude-fable-5-1[1m]}"
+: "${CLODEX_OPUS_MODEL=claude-opus-5[1m]}"
+: "${CLODEX_SONNET_MODEL=claude-sonnet-5[1m]}"
 : "${CLODEX_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
 : "${CODEX_HOME:=$HOME/.codex}"
 : "${CLODEX_CODEX_AUTH:=$CODEX_HOME/auth.json}"
@@ -93,20 +101,31 @@ port_open || start_proxy
 model_env=()
 [ -n "${CLODEX_MODEL:-}" ] && model_env+=("ANTHROPIC_MODEL=$CLODEX_MODEL")
 
-# Auto-compact window. Claude Code believes Fable has a 1M window; the Codex
-# backend's real ceiling for GPT-6 Astra (and the 5.6 family) is
-# max_context_window = 872000 tokens of input (1M minus the 128k output
-# reserve). The old 272000 was the Codex CLI's conservative default and made
-# Claude Code compact at ~24% of the window; a 285k-token request was
-# verified accepted live on 2026-09-14. Claude Code compacts at this value
-# minus ~33k, so 872000 keeps sessions just under the upstream limit.
+# Auto-compact window. The Codex backend's real ceiling for GPT-6 Astra (and
+# the 5.6 family) is max_context_window = 872000 tokens of input (1M minus the
+# 128k output reserve). The old 272000 was the Codex CLI's conservative default
+# and made Claude Code compact at ~24% of the window; a 285k-token request was
+# verified accepted live on 2026-09-14.
+#
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW alone is NOT enough: Claude Code clamps it to
+# the window it *believes* the model has, and on a non-Anthropic base URL every
+# model is believed to be 200k unless its id ends in "[1m]" (the catalog says
+# Fable is natively 1M, but that only counts on api.anthropic.com/Bedrock/
+# Vertex). So the tier ids above carry "[1m]"; with that, `/context` reports
+# 872k instead of 200k. Claude Code compacts at this value minus ~33k.
 : "${CLODEX_AUTO_COMPACT_WINDOW:=872000}"
+
+tier_env=()
+[ -n "${CLODEX_FABLE_MODEL:-}" ]  && tier_env+=("ANTHROPIC_DEFAULT_FABLE_MODEL=$CLODEX_FABLE_MODEL")
+[ -n "${CLODEX_OPUS_MODEL:-}" ]   && tier_env+=("ANTHROPIC_DEFAULT_OPUS_MODEL=$CLODEX_OPUS_MODEL")
+[ -n "${CLODEX_SONNET_MODEL:-}" ] && tier_env+=("ANTHROPIC_DEFAULT_SONNET_MODEL=$CLODEX_SONNET_MODEL")
 
 exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_BASE_URL="http://$CLODEX_HOST:$CLODEX_PORT" \
     ANTHROPIC_AUTH_TOKEN="clodex" \
     ANTHROPIC_SMALL_FAST_MODEL="$CLODEX_SMALL_MODEL" \
     "${model_env[@]}" \
+    "${tier_env[@]}" \
     CLAUDE_CODE_ENABLE_AUTO_MODE=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
