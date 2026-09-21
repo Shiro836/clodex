@@ -52,6 +52,10 @@ use uuid::Uuid;
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+// Claude Code resends every screenshot in the conversation as inline base64 on
+// each turn, so an image-heavy session legitimately outgrows the 16 MiB OpenAI
+// surface cap long before it fills the model's context window.
+const MAX_ANTHROPIC_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -1412,7 +1416,7 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let response = json_error(

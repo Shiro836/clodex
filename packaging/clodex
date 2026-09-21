@@ -38,6 +38,11 @@ set -euo pipefail
 : "${CLODEX_OPUS_MODEL=claude-opus-5[1m]}"
 : "${CLODEX_SONNET_MODEL=claude-sonnet-5[1m]}"
 : "${CLODEX_CLAUDE_BIN:=/opt/claude-code/bin/claude}"
+# Proxy -> Codex transport. The proxy's own default is websocket, but Codex
+# silently drops the socket on large requests (a ~19 MB screenshot-heavy turn
+# hung ~170s, then 502), while the same request over HTTP SSE succeeds.
+# Only read when clodex starts the proxy; `clodex --proxy restart` to apply.
+: "${CLODEX_TRANSPORT:=http}"
 : "${CODEX_HOME:=$HOME/.codex}"
 : "${CLODEX_CODEX_AUTH:=$CODEX_HOME/auth.json}"
 
@@ -58,6 +63,7 @@ start_proxy() {
     # so no separate login is needed. setsid + redirects fully detach it so it
     # persists across clodex sessions.
     CCP_USE_CODEX_CLI_AUTH=1 CODEX_HOME="$CODEX_HOME" \
+        CCP_CODEX_TRANSPORT="$CLODEX_TRANSPORT" \
         setsid "$CLODEX_PROXY_BIN" serve --port "$CLODEX_PORT" \
         >>"$log_file" 2>&1 </dev/null &
     for _ in $(seq 1 100); do
