@@ -10,8 +10,8 @@ set -euo pipefail
 
 : "${CLAUDEEP_BASE_URL:=https://api.deepseek.com/anthropic}"
 : "${CLAUDEEP_MODEL:=}"
-: "${CLAUDEEP_FABLE_MODEL:=deepseek-v4-pro}"
-: "${CLAUDEEP_OPUS_MODEL:=deepseek-v4-pro}"
+: "${CLAUDEEP_FABLE_MODEL:=deepseek-flash}"
+: "${CLAUDEEP_OPUS_MODEL:=deepseek-flash}"
 : "${CLAUDEEP_SONNET_MODEL:=deepseek-flash}"
 : "${CLAUDEEP_HAIKU_MODEL:=deepseek-flash}"
 : "${CLAUDEEP_SUBAGENT_MODEL:=deepseek-flash}"
@@ -33,16 +33,15 @@ die() { printf 'claudeep: %s\n' "$*" >&2; exit 1; }
 [ -x "$CLAUDEEP_CLAUDE_BIN" ] \
     || die "claude binary not found at $CLAUDEEP_CLAUDE_BIN (set CLAUDEEP_CLAUDE_BIN)."
 
-# Keep Claude Code's native picker, but bind each tier to a DeepSeek model
-# explicitly: Fable and Opus to V4 Pro, Sonnet and Haiku to V4.1 Flash
-# (deepseek-flash, served by V4.1-Flash-1017 since 2026-10-17). Left unset,
-# the picker's own IDs go to DeepSeek's name heuristic, which resolves every
-# claude-* name except claude-opus-* — claude-fable-5 included — to Flash.
+# Keep Claude Code's native picker, but bind every tier to V4.1 Flash
+# (deepseek-flash, served by V4.1-Flash-1017 since 2026-10-17) explicitly.
+# Left unset, the picker's own IDs go to DeepSeek's name heuristic, which
+# sends claude-opus-* to V4 Pro and every other claude-* name to Flash.
 # V4.1 Flash is natively multimodal; V4 Pro rejects images with 400. The
 # old deepseek-v4-flash-vision-exp ID is retired and only temporarily routed
-# to deepseek-flash. Opus stays on Pro; set CLAUDEEP_OPUS_MODEL /
-# CLAUDEEP_FABLE_MODEL to deepseek-flash if those tiers should accept images
-# too. Set CLAUDEEP_MODEL to pin one model outright and bypass the picker.
+# to deepseek-flash. Set CLAUDEEP_OPUS_MODEL / CLAUDEEP_FABLE_MODEL to
+# deepseek-v4-pro to put a tier back on Pro. Set CLAUDEEP_MODEL to pin one
+# model outright and bypass the picker.
 #
 # WebSearch needs nothing here: DeepSeek runs Claude Code's server-side
 # web_search tool on its own search engine (free until 2026-10-31 16:00 UTC,

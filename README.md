@@ -87,14 +87,15 @@ Both launchers keep Claude Code's native Opus/Sonnet/Haiku picker.
 
 | Claude Code picker | `clodex` | `claudeep` |
 |--------------------|----------|------------|
-| Opus   | `gpt-5.6-sol` | `deepseek-v4-pro` |
+| Opus   | `gpt-5.6-sol` | `deepseek-flash` |
 | Sonnet | `gpt-5.6-terra` | `deepseek-flash` |
 | Haiku  | `gpt-5.6-luna` | `deepseek-flash` |
 
-Sonnet, Haiku, and subagents use V4.1 Flash (`deepseek-flash`), which is
-natively multimodal, so pasted images and screenshots work. Opus stays on V4
-Pro, which is text-only and returns 400 on images — set
-`CLAUDEEP_OPUS_MODEL=deepseek-flash` if you want vision there too.
+Every `claudeep` tier, Fable and subagents included, uses V4.1 Flash
+(`deepseek-flash`), which is natively multimodal, so pasted images and
+screenshots work. Set `CLAUDEEP_OPUS_MODEL=deepseek-v4-pro` (or
+`CLAUDEEP_FABLE_MODEL`) to put a tier back on V4 Pro, which is text-only and
+returns 400 on images.
 
 WebSearch works under `claudeep` with no extra setup: DeepSeek runs Claude
 Code's server-side search tool on its own engine.
