@@ -59,17 +59,6 @@ die() { printf 'claudeep: %s\n' "$*" >&2; exit 1; }
 # strips the suffix and serves Pro), but on Claude Code's side that suffix
 # makes it assume 1M on its own and stops CLAUDE_CODE_MAX_CONTEXT_TOKENS from
 # applying, so the window stops being adjustable from here.
-#
-# Claude Code treats any model it doesn't recognise on a first-party base URL
-# as one that rejects thinking:disabled, so its side queries (the auto-mode
-# classifier included) leave the thinking field out. DeepSeek reads an absent
-# field as "thinking on, effort high", so every classifier check paid for
-# reasoning it was built to skip. Declaring deepseek-* able to take disabled
-# thinking restores {"type":"disabled"} on those calls; the main loop's
-# thinking setting is unaffected. Entries the caller already set in
-# CLAUDE_CODE_MODEL_CAPABILITIES come after ours and win.
-model_capabilities="deepseek-*=-rejects_disabled_thinking${CLAUDE_CODE_MODEL_CAPABILITIES:+;$CLAUDE_CODE_MODEL_CAPABILITIES}"
-
 model_env=()
 [ -n "$CLAUDEEP_MODEL" ] && model_env+=("ANTHROPIC_MODEL=$CLAUDEEP_MODEL")
 
@@ -84,7 +73,6 @@ exec env -u ANTHROPIC_API_KEY \
     ANTHROPIC_SMALL_FAST_MODEL="$CLAUDEEP_SMALL_MODEL" \
     CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLAUDEEP_MAX_CONTEXT_TOKENS" \
     CLAUDE_CODE_AUTO_COMPACT_WINDOW="$CLAUDEEP_AUTO_COMPACT_WINDOW" \
-    CLAUDE_CODE_MODEL_CAPABILITIES="$model_capabilities" \
     "${model_env[@]}" \
     CLAUDE_CODE_ENABLE_AUTO_MODE=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \

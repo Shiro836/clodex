@@ -100,12 +100,6 @@ returns 400 on images.
 WebSearch works under `claudeep` with no extra setup: DeepSeek runs Claude
 Code's server-side search tool on its own engine.
 
-DeepSeek thinks by default when a request has no `thinking` field, and Claude
-Code leaves that field out of side queries for models it doesn't recognise.
-`claudeep` sets `CLAUDE_CODE_MODEL_CAPABILITIES` so the auto-mode classifier
-and other side queries send `thinking: disabled` as they do for Claude models.
-Main-loop thinking is unchanged.
-
 DeepSeek performs its Claude-name mapping at the API endpoint. Neither launcher
 pins the startup model by default, so the picker stays intact.
 
